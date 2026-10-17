@@ -61,7 +61,8 @@ pwsh -NoProfile -File build.ps1
 | 推送成功后归档（非删除） | `sync.py: SyncEngine._archive_item` | `safe_move` 到归档目录，失败则保留队列下次重试 |
 | 清空归档（二次确认） | `gui/main_window.py: _clear_archive` | 先报文件数与占用，再弹危险确认框 |
 | GitHub 私有仓库 + 自动 commit message | `git_backend.py` / `sync.py: build_commit_message` | `add: 2026-10-11 数学课件.pptx` |
-| 推送失败重试 + 日志 | `git_backend.py: push_with_retry` / `logging_setup.py` | 非快进冲突会自动重新 fetch 再重试，默认 3 次 |
+| 推送失败重试 + 日志 | `api_backend.py: push_with_retry` / `logging_setup.py` | 远端被抢先时重新读取再重试，默认 3 次 |
+| 只上传新增文件，不下载仓库 | `api_backend.py: ApiGitBackend` | 走 Git Data API：`blobs → trees → commits → refs`，一次同步的流量 = 新增文件体积，与仓库历史无关 |
 | Token 存系统密钥链 | `credentials.py` | Windows 凭据管理器 / macOS Keychain / Linux secret-tool |
 | 密钥链失败降级为「本次手动输入」 | `credentials.py: remember_for_session` | **绝不默认存明文** |
 | 单文件 50 MiB 提示 / 90 MiB 阻止 | `fsutil.py` | 阈值可在「设置 → 高级」调整 |
@@ -89,6 +90,7 @@ ArchiveMate/
 │  ├─ credentials.py            跨平台密钥链（Windows 走 ctypes 调 advapi32）
 │  ├─ classify.py               日期 + 类型 → 仓库内相对路径
 │  ├─ fsutil.py                 体积阈值、稳定性判定、安全移动
+│  ├─ api_backend.py            默认推送后端：走 GitHub REST 接口，不下载仓库已有文件
 │  ├─ git_backend.py            bare 仓库 + 底层管道（hash-object/mktree/commit-tree/push）
 │  ├─ github_api.py             纯 urllib 的 GitHub REST 客户端（含代理）
 │  ├─ logging_setup.py          滚动文件日志 + 推给界面的回调
@@ -201,6 +203,41 @@ stdout/stderr 的写端，EOF 永远不会到来 —— 于是「写了 timeout 
 同步进行中界面会出现「取消同步」按钮，它会 `taskkill` 掉当前 git 进程，
 队列内容原样保留（`SyncEngine.cancel()` → `GitBackend.cancel()`）。
 
+### 8. 默认用 GitHub REST 接口建提交，而不是 `git push`
+
+这一条是实测逼出来的，也是本项目最重要的一个转折。
+
+`git` 要能 `push`，本地必须先有一份**完整**的仓库：`fetch` 会把仓库总体积
+（用户这里已经攒到 49 MB，单个 26 MB 的 pptx）整个拉下来。实测这类线路到
+GitHub 的大流量下行只有 20 KB/s 上下，于是「点同步 → 卡在正在同步远端仓库」
+几乎必然发生，而且仓库只会越用越大——**这条路在目标用户的实际网络里走不通**。
+
+先试过 `git fetch --filter=blob:none`（只取目录与提交）：`fetch` 4.5 秒就成功了，
+但紧接着 `git push` 报 `fatal: entry 'README.md' object ... is unavailable`——
+推送前的连通性检查要求本地对象齐全，bare 仓库里的 `pack-objects` 不会按需回源取缺失的 blob。
+**partial clone + git push 这条路是死的**，不要再试。
+
+最终方案是 `archivemate/api_backend.py: ApiGitBackend`，走 Git Data API：
+
+```
+POST /git/blobs  →  POST /git/trees（带 base_tree）  →  POST /git/commits  →  PATCH /git/refs/heads/main
+```
+
+代价与收益：
+
+- 一次同步的流量 = **这次新增文件的体积**，与仓库历史无关。实测对真实的 49 MB
+  私有仓库：读远端状态（`ref` + `tree`）**2.6 秒**，推两个文件各 **约 5 秒**。
+- 目录结构、历史、commit message 全部保留；`base_tree` 保证仓库里原有文件不会被顶掉。
+- 并发推送用 `force: false`，被抢先时（409/422）抛 `PushRejected` 并重试，
+  和 git 后端的非快进处理一致。
+- 界面里的「取消同步」对在线接口只是不再开始下一个请求（HTTP 请求本身打不断）。
+- 单个文件超过 `MAX_INLINE_BYTES`（45 MiB）时**自动退回 git 命令行后端**：
+  blob 接口要把内容 base64 塞进 JSON，太大不合适。此时日志会明确提示
+  「需要先把整个仓库下载到本地」，用户能预期它会慢。
+
+保留 `git_backend.py` 的原因：超大文件、以及不方便用 Token 的场景（比如已经配好
+系统凭据助手的机器）仍然需要它；两者接口一致，`SyncEngine` 不关心用的是哪一个。
+
 ---
 
 ## 测试
@@ -208,10 +245,14 @@ stdout/stderr 的写端，EOF 永远不会到来 —— 于是「写了 timeout 
 ```powershell
 $env:QT_QPA_PLATFORM = 'offscreen'
 python -m unittest discover -s tests
-# Ran 101 tests ... OK
+# Ran 145 tests ... OK
 ```
 
 - **核心逻辑**：分类规则、体积限制、配置读写、状态持久化、同步辅助函数、端到端流水线。
+- **在线推送后端**（`tests/test_api_backend.py`）：`fetch` 只发两个小请求、`base_tree`
+  保证不覆盖已有文件、首个提交不带 `parents`、树没变就不建提交、`force: false`
+  被拒时重试、超过 45 MiB 时拒绝上传且不把文件塞进请求、取消后不再发请求，
+  以及 `SyncEngine` 在「有 Token + 有仓库」时优先选在线接口、超大文件才退回 git。
 - **凭据卫生**（`TestCredentialHygiene`）：Token 不出现在命令行、只以 base64 形式出现在
   `http.extraheader`、配置文件与状态文件里没有 token 字段、源码树里没有硬编码 Token、
   报错信息不回显 Token。这类问题不会报错、只会静悄悄泄露，所以单独钉住。
@@ -248,15 +289,20 @@ python -m unittest discover -s tests
   「OpenSSL + 系统根证书」并重试一次（只重试一次，导不出证书就把原错误抛回去）。
   修复过的结论在同一个进程内记住，后续同步不再重复撞墙。
 - **packfile 传输在本沙箱里过不去**：`ls-remote` 1.7 秒通过、`clone` 小仓库 3 秒完成，
-  但 `school-files`（48 MB）的 `fetch` 在 15 分钟内一个字节都没落盘，
-  加停滞保护时 65 秒后报 `fatal: expected 'packfile'`。直连测速约 26 KB/s，
-  说明是沙箱网络对大流量传输的限制，不是软件逻辑问题——**首次拉取大仓库的
-  成功路径需要在沙箱外验证**。为此把默认 `network_timeout_seconds` 从 300 放宽到
-  1800（真正的防卡死靠 `stall_timeout_seconds` 的低速检测，不是这个总时长）。
+  但 `school-files`（49 MB）的 `fetch` 在 15 分钟内一个字节都没落盘，
+  加停滞保护时 65 秒后报 `fatal: expected 'packfile'`。直连测速约 21.9 KB/s。
+  这个限制直接促成了上面第 8 条——改走在线接口后不再需要下载仓库，
+  **对真实的 49 MB 私有仓库读远端状态只要 2.6 秒**。
+- **在线推送后端已真机端到端验证**：在临时私有仓库
+  `hemuandy/archivemate-e2e-probe` 上连续推两次，各 5.0 / 4.7 秒，
+  远端出现 `2026/10/pdf/a.pdf`、`2026/10/ppt/b.pptx` 且原有 `README.md` 未被改动，
+  commit 历史（`add: 2026-10-17 a.pdf` → …）正确。
+  再用**打包后的 exe**（v1.1.0）跑完整流程 `init → scan → sync`：
+  8 秒内扫描、提交、推送、归档全部完成，远端出现 `2026/10/pdf/打包测试.pdf`。
+  剩下的缺口只是**用户自己那个仓库的首次推送**需要点一次「立即同步」确认。
 - **REST 客户端是真机验证过的**：用无效 Token 调 `GitHubClient.get_user()`，
   真实拿到 HTTP 401 并正确翻译成「Token 无效或已过期」，`status` 也保留了。
-  也就是「网络 + TLS + 请求构造 + 错误映射」这条链是通的，
-  没验证的只是带真实 Token 的成功路径。
+  也就是「网络 + TLS + 请求构造 + 错误映射」这条链是通的。
 - macOS / Linux 的密钥链分支（`security` / `secret-tool`）只做了接口实现，未实机跑过。
 
 ---

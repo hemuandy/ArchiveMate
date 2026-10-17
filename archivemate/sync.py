@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 from . import app_paths, classify, credentials
+from .api_backend import MAX_INLINE_BYTES, ApiGitBackend
 from .config import Config
 from .errors import ArchiveMateError, FileTooLarge, GitError
 from .fsutil import check_size, describe_size_limit, human_size, safe_move
@@ -169,9 +170,20 @@ class SyncEngine:
             root.mkdir(parents=True, exist_ok=True)
         return root
 
-    def build_backend(self) -> GitBackend:
+    def build_backend(self, *, force_git: bool = False) -> GitBackend:
         if self._backend_factory is not None:
             backend = self._backend_factory()
+        elif (not force_git and self._use_api_backend()):
+            backend = ApiGitBackend(
+                self.token or "",
+                self.config.repository.owner,
+                self.config.repository.name,
+                self.config.repository.branch,
+                proxy=self.config.git.proxy,
+                network_timeout=self.config.git.resolved_network_timeout(),
+                logger=self._log,
+                on_progress=self._progress,
+            )
         else:
             ssl_backend = self.config.git.resolved_ssl_backend()
             ssl_ca_info = self.config.git.resolved_ssl_ca_info()
@@ -196,6 +208,16 @@ class SyncEngine:
         with self._backend_lock:
             self._backend = backend
         return backend
+
+    def _use_api_backend(self) -> bool:
+        """能走在线接口就走在线接口：只上传新文件，不下载仓库历史。"""
+        repository = self.config.repository
+        return bool(
+            self.token
+            and repository.owner.strip()
+            and repository.name.strip()
+            and repository.branch.strip()
+        )
 
     def _remember_tls_repair(self, backend: GitBackend) -> None:
         """记下自愈结果，让本进程后续同步少走一次弯路。"""
@@ -308,8 +330,15 @@ class SyncEngine:
             return outcome
 
         try:
-            backend = self.build_backend()
-            self._progress("fetch", "正在同步远端仓库……")
+            # 超大的单个文件放不进在线接口的 JSON，只能退回 git 命令行（要下载整个仓库）
+            biggest = max((item.size for item in ready), default=0)
+            force_git = biggest > MAX_INLINE_BYTES
+            if force_git:
+                self._log(
+                    f"有 {biggest / 1024 / 1024:.0f} MB 的文件，超出在线接口上限，"
+                    "改用 git 命令行推送（需要先把整个仓库下载到本地）。")
+            backend = self.build_backend(force_git=force_git)
+            self._progress("fetch", "正在读取远端仓库状态……")
             backend.fetch()
         except GitError as exc:
             outcome.ok = False

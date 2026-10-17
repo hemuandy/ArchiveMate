@@ -57,7 +57,8 @@ class GitHubClient:
     # ------------------------------------------------------------------
 
     def _request(self, method: str, path: str, payload: dict | None = None,
-                 *, params: dict | None = None) -> Any:
+                 *, params: dict | None = None,
+                 timeout: float | None = None) -> Any:
         url = path if path.startswith("http") else f"{API_ROOT}{path}"
         if params:
             url = f"{url}?{urllib.parse.urlencode(params)}"
@@ -72,8 +73,10 @@ class GitHubClient:
             body = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        # 上传文件时单次请求可能要跑几分钟（慢网络），允许调用方放宽超时
+        effective_timeout = self.timeout if timeout is None else timeout
         try:
-            with self._opener.open(request, timeout=self.timeout) as response:
+            with self._opener.open(request, timeout=effective_timeout) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             raise GitHubError(self._explain(exc), status=exc.code) from exc
