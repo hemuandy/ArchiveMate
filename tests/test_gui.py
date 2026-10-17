@@ -373,7 +373,7 @@ class TestDialogs(unittest.TestCase):
         self.addCleanup(dialog.deleteLater)
 
         # 默认值来自配置
-        self.assertEqual(dialog.network_timeout_spin.value(), 300)
+        self.assertEqual(dialog.network_timeout_spin.value(), 1800)
         self.assertEqual(dialog.stall_spin.value(), 60)
 
         dialog.network_timeout_spin.setValue(120)

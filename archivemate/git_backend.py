@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 from .errors import GitError, PushRejected
+from .tls_certs import ensure_ca_bundle
 
 Logger = Callable[[str], None]
 
@@ -39,7 +40,7 @@ _NON_FAST_FORWARD_MARKERS = (
 # 必须由 git 自己放弃，否则它会一直等下去。
 _STALL_LIMIT_BYTES_PER_SECOND = 1000
 _DEFAULT_STALL_SECONDS = 60
-_DEFAULT_NETWORK_TIMEOUT = 300
+_DEFAULT_NETWORK_TIMEOUT = 1800
 
 
 def _noop(_message: str) -> None:
@@ -226,6 +227,32 @@ class FileToCommit:
     dest_rel: str
 
 
+def _classify_transport_error(stderr: str) -> str:
+    """把 git 的 stderr 归类，供自动修复与提示复用。"""
+    lowered = (stderr or "").lower()
+    if ("acquirecredentialshandle" in lowered
+            or "sec_e_no_credentials" in lowered
+            or "schannel" in lowered):
+        return "schannel"
+    if ("ssl certificate" in lowered
+            or "certificate verify" in lowered
+            or "local issuer certificate" in lowered
+            or "server certificate verification failed" in lowered
+            or "ssl_error" in lowered):
+        return "cert"
+    if "could not resolve host" in lowered:
+        return "dns"
+    if "too slow" in lowered or "bytes/sec" in lowered:
+        return "slow"
+    if "timed out" in lowered or "operation timed out" in lowered:
+        return "timeout"
+    if ("authentication failed" in lowered or " 401" in lowered or " 403" in lowered):
+        return "auth"
+    if "repository not found" in lowered or "not found" in lowered:
+        return "repo"
+    return "other"
+
+
 class GitBackend:
     def __init__(
         self,
@@ -236,6 +263,7 @@ class GitBackend:
         git_exe: str = "git",
         proxy: str = "",
         ssl_backend: str = "",
+        ssl_ca_info: str = "",
         author_name: str = "ArchiveMate",
         author_email: str = "archivemate@localhost",
         token: str | None = None,
@@ -250,6 +278,11 @@ class GitBackend:
         self.proxy = (proxy or "").strip()
         backend = (ssl_backend or "").strip().lower()
         self.ssl_backend = backend if backend in ("schannel", "openssl") else ""
+        self.ssl_ca_info = (ssl_ca_info or "").strip()
+        self._tls_healed = False
+        # 自愈成功后回调一次，好让上层（SyncEngine）在本进程内记住这个结果，
+        # 下次同步就不用再撞一次同样的墙。只存内存，不写配置文件。
+        self.on_tls_healed: "Callable[[GitBackend], None] | None" = None
         self.author_name = author_name
         self.author_email = author_email
         self.token = token
@@ -361,6 +394,8 @@ class GitBackend:
                 command += ["-c", f"http.proxy={self.proxy}"]
             if self.ssl_backend:
                 command += ["-c", f"http.sslBackend={self.ssl_backend}"]
+            if self.ssl_ca_info:
+                command += ["-c", f"http.sslCAInfo={self.ssl_ca_info}"]
             if self.stall_seconds:
                 # 连接建立后长时间没有数据就自己放弃，而不是一直等。
                 command += ["-c", f"http.lowSpeedLimit={_STALL_LIMIT_BYTES_PER_SECOND}",
@@ -393,6 +428,14 @@ class GitBackend:
         result.stdout = (result.stdout or b"").decode("utf-8", "replace")
         result.stderr = (result.stderr or b"").decode("utf-8", "replace")
 
+        # 证书类失败不分 check 与否都要试着自愈一次：否则 check=False 的
+        # 调用（remote_branch_exists 等）会绕过修复，用户只看到证书报错。
+        if result.returncode != 0 and self._heal_tls(result.stderr or ""):
+            self._log(
+                "HTTPS 连接被证书问题挡住，已自动改用 OpenSSL + 系统根证书重试一次。")
+            return self._run(args, check=check, input_text=input_text,
+                             timeout=timeout, use_git_dir=use_git_dir)
+
         if check and result.returncode != 0:
             raise GitError(
                 self._friendly_error(result),
@@ -401,6 +444,43 @@ class GitBackend:
                 stderr=result.stderr or "",
             )
         return result
+
+    def _heal_tls(self, stderr: str) -> bool:
+        """证书类失败时，自动切到「OpenSSL + 系统根证书」再试一次。
+
+        这一步能救回来的情况很具体：Windows 的 schannel 拿不到凭据
+        （`SEC_E_NO_CREDENTIALS`），或者 OpenSSL 不认 Git 自带的 CA 包
+        （`unable to get local issuer certificate`）。两者都只需要把
+        系统真正信任的根证书导出来交给 OpenSSL。
+        """
+        if self._tls_healed:
+            return False
+        if _classify_transport_error(stderr) not in ("schannel", "cert"):
+            return False
+        bundle = self.ssl_ca_info
+        if bundle and not Path(bundle).is_file():
+            # 配置里记的旧 CA 包被删了（换过机器、清过 cache），重新导出。
+            bundle = ""
+        if bundle:
+            found = bundle
+        else:
+            exported = ensure_ca_bundle(self.repo_dir.parent)
+            if exported is None:
+                # 导不出证书（非 Windows，或系统库不给），只能把原错误抛回去。
+                # 记下「已经试过」，免得每次失败都重新导一遍证书。
+                self._tls_healed = True
+                return False
+            found = str(exported)
+        # 确定拿到了 CA 包再改状态：否则报错文案会和实际后端对不上。
+        self._tls_healed = True
+        self.ssl_backend = "openssl"
+        self.ssl_ca_info = found
+        if self.on_tls_healed is not None:
+            try:
+                self.on_tls_healed(self)
+            except Exception:       # 回调只是锦上添花，不能拖垮同步
+                pass
+        return True
 
     def _friendly_error(self, result: subprocess.CompletedProcess) -> str:
         stderr = result.stderr or ""

@@ -119,6 +119,9 @@ class SyncEngine:
         self._backend: GitBackend | None = None
         self._backend_lock = threading.Lock()
         self._cancelled = False
+        # 本进程内记住「证书自愈」的结论，下次同步直接用它，不必再撞一次车。
+        # 只在内存里，不写配置文件——写盘会有并发覆盖设置的隐患。
+        self._tls_repair: tuple[str, str] | None = None
 
     # ------------------------------------------------------------------
     # 取消
@@ -170,13 +173,18 @@ class SyncEngine:
         if self._backend_factory is not None:
             backend = self._backend_factory()
         else:
+            ssl_backend = self.config.git.resolved_ssl_backend()
+            ssl_ca_info = self.config.git.resolved_ssl_ca_info()
+            if self._tls_repair is not None:
+                ssl_backend, ssl_ca_info = self._tls_repair
             backend = GitBackend(
                 app_paths.repo_cache_dir(),
                 self.config.repository.resolved_remote_url(),
                 self.config.repository.branch,
                 git_exe=find_git(self.config.git.resolved_executable()) or "git",
                 proxy=self.config.git.proxy,
-                ssl_backend=self.config.git.resolved_ssl_backend(),
+                ssl_backend=ssl_backend,
+                ssl_ca_info=ssl_ca_info,
                 author_name=self.config.git.author_name,
                 author_email=self.config.git.author_email,
                 token=self.token,
@@ -184,9 +192,14 @@ class SyncEngine:
                 network_timeout=self.config.git.resolved_network_timeout(),
                 logger=self._log,
             )
+            backend.on_tls_healed = self._remember_tls_repair
         with self._backend_lock:
             self._backend = backend
         return backend
+
+    def _remember_tls_repair(self, backend: GitBackend) -> None:
+        """记下自愈结果，让本进程后续同步少走一次弯路。"""
+        self._tls_repair = (backend.ssl_backend, backend.ssl_ca_info)
 
     # ------------------------------------------------------------------
     # 队列准备

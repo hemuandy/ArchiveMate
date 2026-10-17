@@ -68,6 +68,7 @@ pwsh -NoProfile -File build.ps1
 | 单次推送 2 GiB 以内 | `sync.py: chunk_by_size` | 自动分批提交 |
 | 代理配置 | `config.py: GitConfig.proxy` / `github_api.py` | 同时作用于 git 与 GitHub REST API |
 | HTTPS 证书后端可切换 | `config.py: GitConfig.ssl_backend` / `git_backend.py` | `http.sslBackend=schannel/openssl`；排查证书类推送失败 |
+| 证书问题自动自愈 | `archivemate/tls_certs.py` / `git_backend.py: _heal_tls` | 证书类失败时自动「导出系统根证书 → 切 OpenSSL → 重试一次」，用户不用手改 git 配置 |
 | 网络等待上限（不无限卡住） | `git_backend.py: run_command` / `config.py: GitConfig.network_timeout_seconds, stall_timeout_seconds` | 无管道子进程 + 停滞保护 + 硬超时，三层兜底 |
 | 同步可中断 | `sync.py: SyncEngine.cancel` / `service.py: cancel_sync` / `gui/main_window.py: _cancel_sync` | 同步中显示「取消同步」，掐掉 git 进程，队列不丢 |
 | 无需多设备同步 | — | 单机设计，不做同步协议 |
@@ -192,7 +193,10 @@ stdout/stderr 的写端，EOF 永远不会到来 —— 于是「写了 timeout 
 | 配置 | 默认 | 作用 |
 | --- | --- | --- |
 | `git.stall_timeout_seconds` | 60 | 传给 git 的 `http.lowSpeedLimit=1000` + `http.lowSpeedTime=N`，连接建立后数据停滞就放弃；`0` 表示关闭 |
-| `git.network_timeout_seconds` | 300 | 每次网络操作的硬上限，到点一定返回 |
+| `git.network_timeout_seconds` | 1800 | 每次网络操作的硬上限，到点一定返回 |
+| `git.stall_timeout_seconds` | 60 | 连接建立了但 60 秒内几乎没数据就放弃（真正的防卡死） |
+| `git.ssl_backend` | `""`（跟随系统） | `schannel` / `openssl`；留空时若出错会自动修 |
+| `git.ssl_ca_info` | `""` | 交给 OpenSSL 的 CA 包，留空则按需从系统证书库导出 |
 
 同步进行中界面会出现「取消同步」按钮，它会 `taskkill` 掉当前 git 进程，
 队列内容原样保留（`SyncEngine.cancel()` → `GitBackend.cancel()`）。
@@ -236,9 +240,19 @@ python -m unittest discover -s tests
   `https://github.com/...` 的真实推送需要在沙箱外手工验证一次。
 - 顺带发现：本沙箱里 git 的默认 TLS 后端 `schannel` 拿不到系统凭据
   （`AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`），
-  换成 `http.sslBackend=openssl` 才连得上。这不是软件的问题，
-  但既然用户可能遇到同类报错，就顺手做了两件事：把这类报错翻译成人话，
-  并在「设置 → 高级」加了可切换的 HTTPS 证书后端。
+  换成 `http.sslBackend=openssl` 又报 `unable to get local issuer certificate`
+  （Git 自带 CA 包不覆盖本机信任链），只有再补一份**从系统证书库导出的 PEM**
+  才连得上。既然用户很可能遇到同一类报错，就做成了自动修复：
+  `archivemate/tls_certs.py` 用 `ssl.create_default_context().get_ca_certs(binary_form=True)`
+  导出根证书，`git_backend.py: _heal_tls` 在识别到证书类失败时自动切
+  「OpenSSL + 系统根证书」并重试一次（只重试一次，导不出证书就把原错误抛回去）。
+  修复过的结论在同一个进程内记住，后续同步不再重复撞墙。
+- **packfile 传输在本沙箱里过不去**：`ls-remote` 1.7 秒通过、`clone` 小仓库 3 秒完成，
+  但 `school-files`（48 MB）的 `fetch` 在 15 分钟内一个字节都没落盘，
+  加停滞保护时 65 秒后报 `fatal: expected 'packfile'`。直连测速约 26 KB/s，
+  说明是沙箱网络对大流量传输的限制，不是软件逻辑问题——**首次拉取大仓库的
+  成功路径需要在沙箱外验证**。为此把默认 `network_timeout_seconds` 从 300 放宽到
+  1800（真正的防卡死靠 `stall_timeout_seconds` 的低速检测，不是这个总时长）。
 - **REST 客户端是真机验证过的**：用无效 Token 调 `GitHubClient.get_user()`，
   真实拿到 HTTP 401 并正确翻译成「Token 无效或已过期」，`status` 也保留了。
   也就是「网络 + TLS + 请求构造 + 错误映射」这条链是通的，

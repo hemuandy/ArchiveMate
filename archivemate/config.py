@@ -78,12 +78,17 @@ class GitConfig:
     # 国内一部分环境里 schannel 会因为安全软件/企业证书出问题，
     # 换成 "openssl" 是标准的绕行办法。
     ssl_backend: str = ""               # "" | "schannel" | "openssl"
+    # 交给 OpenSSL 后端的 CA 包路径。留空 = 需要时自动从系统证书库导出。
+    ssl_ca_info: str = ""
     author_name: str = "ArchiveMate"
     author_email: str = "archivemate@localhost"
     retry_count: int = 3
     retry_delay_seconds: float = 3.0
     # 一次网络操作（ls-remote / fetch / push）最多等多久。
-    network_timeout_seconds: int = 300
+    # 这里给得比较宽：首次同步要把整个仓库拉下来，慢网络下几十 MB 花上
+    # 十几分钟很正常。真正防「卡死」的是下面的 stall_timeout（git 自己的
+    # 低速检测），不是这个总时长上限。
+    network_timeout_seconds: int = 1800
     # 连接建立后多久没有数据就放弃（git 自己没有任何默认超时，
     # 网络被黑洞掉时会一直等下去）。
     stall_timeout_seconds: int = 60
@@ -95,12 +100,15 @@ class GitConfig:
         value = (self.ssl_backend or "").strip().lower()
         return value if value in ("schannel", "openssl") else ""
 
+    def resolved_ssl_ca_info(self) -> str:
+        return (self.ssl_ca_info or "").strip()
+
     def resolved_network_timeout(self) -> int:
         try:
             seconds = int(self.network_timeout_seconds)
         except (TypeError, ValueError):
-            return 300
-        return min(3600, max(30, seconds))
+            return 1800
+        return min(7200, max(30, seconds))
 
     def resolved_stall_timeout(self) -> int:
         try:
@@ -195,11 +203,12 @@ class Config:
                 executable=_as_str(git.get("executable"), ""),
                 proxy=_as_str(git.get("proxy"), ""),
                 ssl_backend=_as_str(git.get("ssl_backend"), ""),
+                ssl_ca_info=_as_str(git.get("ssl_ca_info"), ""),
                 author_name=_as_str(git.get("author_name"), "ArchiveMate"),
                 author_email=_as_str(git.get("author_email"), "archivemate@localhost"),
                 retry_count=_as_int(git.get("retry_count"), 3),
                 retry_delay_seconds=_as_float(git.get("retry_delay_seconds"), 3.0),
-                network_timeout_seconds=_as_int(git.get("network_timeout_seconds"), 300),
+                network_timeout_seconds=_as_int(git.get("network_timeout_seconds"), 1800),
                 stall_timeout_seconds=_as_int(git.get("stall_timeout_seconds"), 60),
             )
 

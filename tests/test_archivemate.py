@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from archivemate import app_paths, classify  # noqa: E402
+from archivemate import app_paths, classify, tls_certs  # noqa: E402
 from archivemate.config import Config, normalize_extension  # noqa: E402
 from archivemate.errors import ConfigError, FileTooLarge, GitError  # noqa: E402
 from archivemate.fsutil import (  # noqa: E402
@@ -482,7 +482,10 @@ class TestEndToEnd(unittest.TestCase):
         self.assertNotIn("笔记.txt", "".join(tree))
 
         log = self._git("log", "--format=%s", "main").strip()
-        self.assertTrue(log.startswith("add: 2026-10-11"), log)
+        # 多文件提交的日期用「提交当天」，单文件才用文件自身日期——
+        # 所以这里不能写死某一天，否则换天跑就红。
+        self.assertEqual(log.splitlines()[0],
+                         f"add: {datetime.now().strftime('%Y-%m-%d')} 2 个文件")
 
         # --- 归档 ---
         self.assertTrue((self.archive / "2026/10/ppt/数学课件.pptx").is_file())
@@ -807,6 +810,322 @@ class TestTransportDiagnostics(unittest.TestCase):
         config = Config.default()
         config.git.ssl_backend = "../evil"
         self.assertEqual(config.git.resolved_ssl_backend(), "")
+
+
+class TestTlsSelfHeal(unittest.TestCase):
+    """证书一挂就自动切「OpenSSL + 系统根证书」。
+
+    真实起因：本机 Git 默认的 schannel 后端报
+    `SEC_E_NO_CREDENTIALS`，换 OpenSSL 又报 `unable to get local issuer
+    certificate`——只有把系统信任的根证书导成 PEM 才能连上 GitHub。
+    让普通学生去手改 git 配置不现实，所以软件自己修。
+    """
+
+    def setUp(self):
+        self.home = _mkdtemp("heal-")
+        self.bundle = self.home / "ca-bundle.pem"
+        # fetch() 第一步是建本地 bare 仓库，那是纯本地文件操作；
+        # 这里只关心网络那一步，跳过它。
+        self.enterContext(
+            mock.patch.object(GitBackend, "ensure_repo", lambda self: None))
+
+    def _backend(self, **kwargs) -> GitBackend:
+        return GitBackend(self.home / "r.git", "https://github.com/a/b.git", "main",
+                          git_exe="git", logger=lambda _m: None, **kwargs)
+
+    def _fake_run(self, stderr: str, returncode: int = 128):
+        """假装 git 失败，并返回一个记录调用的替身。"""
+        calls: list[list[str]] = []
+
+        def fake(args, **kwargs):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(
+                ["git"], returncode, b"", stderr.encode("utf-8"))
+
+        return fake, calls
+
+    # -- 触发条件 -----------------------------------------------------------
+
+    def test_schannel_error_triggers_the_switch(self):
+        backend = self._backend()
+        fake, _calls = self._fake_run(
+            "fatal: unable to access 'https://github.com/a/b.git/': "
+            "schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS")
+        with mock.patch("archivemate.git_backend.ensure_ca_bundle",
+                        return_value=self.bundle):
+            with mock.patch("archivemate.git_backend.run_command", fake):
+                with self.assertRaises(GitError):
+                    backend.fetch()
+        self.assertTrue(backend._tls_healed)
+        self.assertEqual(backend.ssl_backend, "openssl")
+        self.assertEqual(backend.ssl_ca_info, str(self.bundle))
+
+    def test_certificate_error_triggers_the_switch(self):
+        backend = self._backend()
+        fake, _calls = self._fake_run(
+            "fatal: unable to access 'https://github.com/a/b.git/': "
+            "SSL certificate problem: unable to get local issuer certificate")
+        with mock.patch("archivemate.git_backend.ensure_ca_bundle",
+                        return_value=self.bundle):
+            with mock.patch("archivemate.git_backend.run_command", fake):
+                with self.assertRaises(GitError):
+                    backend.fetch()
+        self.assertEqual(backend.ssl_backend, "openssl")
+
+    def test_unrelated_failure_does_not_touch_the_settings(self):
+        backend = self._backend()
+        fake, _calls = self._fake_run(
+            "fatal: unable to access 'https://github.com/a/b.git/': "
+            "Could not resolve host: github.com")
+        with mock.patch("archivemate.git_backend.run_command", fake):
+            with self.assertRaises(GitError):
+                backend.fetch()
+        self.assertFalse(backend._tls_healed)
+        self.assertEqual(backend.ssl_backend, "")
+        self.assertEqual(backend.ssl_ca_info, "")
+
+    # -- 重试行为 -----------------------------------------------------------
+
+    def test_the_retry_carries_openssl_and_the_bundle(self):
+        """第一次失败 → 第二次的 git 命令里必须真的带上新设置。"""
+        backend = self._backend()
+        calls: list[list[str]] = []
+        failure = (
+            "fatal: unable to access 'https://github.com/a/b.git/': "
+            "schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS")
+
+        def fake(args, **kwargs):
+            calls.append(list(args))
+            if len(calls) == 1:
+                return subprocess.CompletedProcess(
+                    ["git"], 128, b"", failure.encode("utf-8"))
+            return subprocess.CompletedProcess(["git"], 0, b"", b"")
+
+        with mock.patch("archivemate.git_backend.ensure_ca_bundle",
+                        return_value=self.bundle):
+            with mock.patch("archivemate.git_backend.run_command", fake):
+                backend.fetch()
+
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertNotIn("http.sslBackend=openssl", " ".join(calls[0]))
+        self.assertIn("http.sslBackend=openssl", " ".join(calls[1]))
+        self.assertIn(f"http.sslCAInfo={self.bundle}", " ".join(calls[1]))
+
+    def test_retry_only_happens_once(self):
+        """第二次还失败就如实报错，不能无限重试。"""
+        backend = self._backend()
+        calls: list[list[str]] = []
+        failure = (
+            "fatal: unable to access 'https://github.com/a/b.git/': "
+            "schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS")
+
+        def fake(args, **kwargs):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(
+                ["git"], 128, b"", failure.encode("utf-8"))
+
+        with mock.patch("archivemate.git_backend.ensure_ca_bundle",
+                        return_value=self.bundle):
+            with mock.patch("archivemate.git_backend.run_command", fake):
+                with self.assertRaises(GitError):
+                    backend.fetch()
+
+        self.assertEqual(len(calls), 2)
+
+    def test_an_existing_bundle_is_reused_without_exporting_again(self):
+        self.bundle.write_text("-----BEGIN CERTIFICATE-----\n", encoding="ascii")
+        backend = self._backend(ssl_ca_info=str(self.bundle))
+        fake, _calls = self._fake_run(
+            "fatal: unable to access 'https://github.com/a/b.git/': "
+            "schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS")
+        with mock.patch("archivemate.git_backend.ensure_ca_bundle") as exporter:
+            with mock.patch("archivemate.git_backend.run_command", fake):
+                with self.assertRaises(GitError):
+                    backend.fetch()
+            exporter.assert_not_called()
+        self.assertEqual(backend.ssl_ca_info, str(self.bundle))
+
+    def test_no_bundle_means_no_behaviour_change(self):
+        """导不出证书时不能假装修好了：后端设置保持原样。"""
+        backend = self._backend()
+        fake, _calls = self._fake_run(
+            "fatal: unable to access 'https://github.com/a/b.git/': "
+            "schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS")
+        with mock.patch("archivemate.git_backend.ensure_ca_bundle",
+                        return_value=None):
+            with mock.patch("archivemate.git_backend.run_command", fake):
+                with self.assertRaises(GitError):
+                    backend.fetch()
+        self.assertEqual(backend.ssl_backend, "")
+        self.assertEqual(backend.ssl_ca_info, "")
+
+    def test_a_deleted_bundle_is_exported_again(self):
+        """配置里记的 CA 包被删掉（清了 cache / 拷到别的机器）时要能自恢复。"""
+        missing = self.home / "gone.pem"
+        backend = self._backend(ssl_ca_info=str(missing))
+        fake, _calls = self._fake_run(
+            "fatal: unable to access 'https://github.com/a/b.git/': "
+            "SSL certificate problem: unable to get local issuer certificate")
+        with mock.patch("archivemate.git_backend.ensure_ca_bundle",
+                        return_value=self.bundle) as exporter:
+            with mock.patch("archivemate.git_backend.run_command", fake):
+                with self.assertRaises(GitError):
+                    backend.fetch()
+            exporter.assert_called_once()
+        self.assertEqual(backend.ssl_ca_info, str(self.bundle))
+
+    def test_the_heal_is_reported_to_the_caller(self):
+        backend = self._backend()
+        seen: list[tuple[str, str]] = []
+        backend.on_tls_healed = lambda b: seen.append((b.ssl_backend, b.ssl_ca_info))
+        fake, _calls = self._fake_run(
+            "fatal: unable to access 'https://github.com/a/b.git/': "
+            "schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS")
+        with mock.patch("archivemate.git_backend.ensure_ca_bundle",
+                        return_value=self.bundle):
+            with mock.patch("archivemate.git_backend.run_command", fake):
+                with self.assertRaises(GitError):
+                    backend.fetch()
+        self.assertEqual(seen, [("openssl", str(self.bundle))])
+
+    def test_a_failing_callback_does_not_break_the_sync(self):
+        backend = self._backend()
+
+        def boom(_backend):
+            raise RuntimeError("回调炸了")
+
+        backend.on_tls_healed = boom
+        fake, _calls = self._fake_run(
+            "fatal: unable to access 'https://github.com/a/b.git/': "
+            "schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS")
+        with mock.patch("archivemate.git_backend.ensure_ca_bundle",
+                        return_value=self.bundle):
+            with mock.patch("archivemate.git_backend.run_command", fake):
+                with self.assertRaises(GitError):
+                    backend.fetch()
+        self.assertEqual(backend.ssl_backend, "openssl")
+
+
+class TestTlsCertBundle(unittest.TestCase):
+    """`archivemate/tls_certs.py`：导出系统根证书。"""
+
+    def setUp(self):
+        self.home = _mkdtemp("certs-")
+
+    def test_the_real_system_has_usable_roots(self):
+        path = tls_certs.export_system_roots(self.home / "out.pem")
+        self.assertIsNotNone(path, "系统证书库应该能导出根证书")
+        self.assertGreater(tls_certs.count_certificates(path), 10)
+        text = path.read_text(encoding="ascii")
+        self.assertIn("-----BEGIN CERTIFICATE-----", text)
+        self.assertIn("-----END CERTIFICATE-----", text)
+
+    def test_a_fresh_bundle_is_reused(self):
+        first = tls_certs.ensure_ca_bundle(self.home)
+        self.assertIsNotNone(first)
+        stamp = first.stat().st_mtime
+        second = tls_certs.ensure_ca_bundle(self.home)
+        self.assertEqual(first, second)
+        self.assertEqual(second.stat().st_mtime, stamp, "新鲜的证书包不该被重写")
+
+    def test_a_stale_bundle_is_refreshed(self):
+        first = tls_certs.ensure_ca_bundle(self.home)
+        self.assertIsNotNone(first)
+        old = time.time() - 30 * 24 * 3600
+        os.utime(first, (old, old))
+        with mock.patch("archivemate.tls_certs.export_system_roots",
+                        return_value=first) as exporter:
+            tls_certs.ensure_ca_bundle(self.home)
+        exporter.assert_called_once()
+
+    def test_an_empty_file_does_not_count_as_a_bundle(self):
+        bundle = self.home / tls_certs.BUNDLE_NAME
+        bundle.write_text("", encoding="ascii")
+        with mock.patch("archivemate.tls_certs.export_system_roots",
+                        return_value=bundle) as exporter:
+            tls_certs.ensure_ca_bundle(self.home)
+        exporter.assert_called_once()
+
+    def test_export_never_raises(self):
+        with mock.patch("archivemate.tls_certs.ssl.create_default_context",
+                        side_effect=OSError("boom")):
+            self.assertIsNone(tls_certs.export_system_roots(self.home / "x.pem"))
+
+    def test_export_gives_up_when_the_system_returns_nothing(self):
+        context = mock.MagicMock()
+        context.get_ca_certs.return_value = []
+        with mock.patch("archivemate.tls_certs.ssl.create_default_context",
+                        return_value=context):
+            self.assertIsNone(tls_certs.export_system_roots(self.home / "x.pem"))
+
+    def test_unwritable_destination_returns_none(self):
+        blocker = self.home / "file"
+        blocker.write_text("x", encoding="utf-8")
+        self.assertIsNone(tls_certs.export_system_roots(blocker / "nested.pem"))
+
+    def test_count_certificates_tolerates_missing_files(self):
+        self.assertEqual(tls_certs.count_certificates(self.home / "nope.pem"), 0)
+
+    def test_config_roundtrip_preserves_ssl_ca_info(self):
+        config = Config.default()
+        config.git.ssl_ca_info = r"C:\some\bundle.pem"
+        restored = Config.from_dict(json.loads(json.dumps(config.to_dict())))
+        self.assertEqual(restored.git.resolved_ssl_ca_info(), r"C:\some\bundle.pem")
+
+    def test_sync_engine_passes_the_bundle_through(self):
+        """配置里的 CA 包要真的落到 GitBackend 上，否则自愈查出证书也没用。"""
+        from archivemate.sync import SyncEngine
+
+        old = os.environ.get("ARCHIVEMATE_HOME")
+        os.environ["ARCHIVEMATE_HOME"] = str(self.home / "data")
+        app_paths.reset_cache()
+        try:
+            config = Config.default()
+            config.git.ssl_ca_info = r"C:\some\bundle.pem"
+            config.git.ssl_backend = "openssl"
+            tracker = Tracker(self.home / "state.json")
+            engine = SyncEngine(config, tracker, logger=lambda _m: None)
+            backend = engine.build_backend()
+            self.assertEqual(backend.ssl_ca_info, r"C:\some\bundle.pem")
+            self.assertEqual(backend.ssl_backend, "openssl")
+        finally:
+            if old is None:
+                os.environ.pop("ARCHIVEMATE_HOME", None)
+            else:
+                os.environ["ARCHIVEMATE_HOME"] = old
+            app_paths.reset_cache()
+
+    def test_the_engine_remembers_the_repair_for_the_next_sync(self):
+        """自愈过一次之后，同一进程里的下一次同步不该再撞同一堵墙。"""
+        from archivemate.sync import SyncEngine
+
+        old = os.environ.get("ARCHIVEMATE_HOME")
+        os.environ["ARCHIVEMATE_HOME"] = str(self.home / "data")
+        app_paths.reset_cache()
+        try:
+            config = Config.default()
+            tracker = Tracker(self.home / "state.json")
+            engine = SyncEngine(config, tracker, logger=lambda _m: None)
+
+            first = engine.build_backend()
+            self.assertIsNotNone(first.on_tls_healed)
+            self.assertEqual(first.ssl_backend, "")
+
+            # 假装它自己修好了，并回调上层
+            bundle = self.home / "ca-bundle.pem"
+            first.ssl_backend = "openssl"
+            first.ssl_ca_info = str(bundle)
+            first.on_tls_healed(first)
+
+            second = engine.build_backend()
+            self.assertEqual(second.ssl_backend, "openssl")
+            self.assertEqual(second.ssl_ca_info, str(bundle))
+        finally:
+            if old is None:
+                os.environ.pop("ARCHIVEMATE_HOME", None)
+            else:
+                os.environ["ARCHIVEMATE_HOME"] = old
+            app_paths.reset_cache()
 
 
 class _FakeResponse:
@@ -1209,7 +1528,7 @@ class TestConfigTimeouts(unittest.TestCase):
         from archivemate.config import GitConfig
 
         git = GitConfig()
-        self.assertEqual(git.resolved_network_timeout(), 300)
+        self.assertEqual(git.resolved_network_timeout(), 1800)
         self.assertEqual(git.resolved_stall_timeout(), 60)
 
     def test_clamping(self):
@@ -1218,6 +1537,8 @@ class TestConfigTimeouts(unittest.TestCase):
         git = GitConfig(network_timeout_seconds=5, stall_timeout_seconds=9999)
         self.assertEqual(git.resolved_network_timeout(), 30)
         self.assertEqual(git.resolved_stall_timeout(), 600)
+        huge = GitConfig(network_timeout_seconds=99999)
+        self.assertEqual(huge.resolved_network_timeout(), 7200)
 
     def test_zero_stall_means_off_and_garbage_falls_back(self):
         from archivemate.config import GitConfig
@@ -1225,7 +1546,7 @@ class TestConfigTimeouts(unittest.TestCase):
         self.assertEqual(GitConfig(stall_timeout_seconds=0).resolved_stall_timeout(), 0)
         self.assertEqual(
             GitConfig(network_timeout_seconds="x",
-                      stall_timeout_seconds=None).resolved_network_timeout(), 300)
+                      stall_timeout_seconds=None).resolved_network_timeout(), 1800)
         self.assertEqual(
             GitConfig(network_timeout_seconds="x",
                       stall_timeout_seconds=None).resolved_stall_timeout(), 60)

@@ -202,7 +202,7 @@ class SettingsDialog(QDialog):
         net_form.addRow("", ssl_hint)
 
         self.network_timeout_spin = QSpinBox(net_box)
-        self.network_timeout_spin.setRange(30, 3600)
+        self.network_timeout_spin.setRange(30, 7200)
         self.network_timeout_spin.setSuffix(" 秒")
         self.network_timeout_spin.setValue(self._config.git.resolved_network_timeout())
         self.network_timeout_spin.setToolTip(
