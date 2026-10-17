@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.manifest
+
+# 运行期数据（便携模式下会生成在项目根目录）
+config.json
+state.json
+logs/
+cache/
+
+# 测试与调试的临时目录
+.testrun/
+.tmp/
+.probe/
+.devhome/
+.shot/
+.clitest/
+.smoketest/
+out.txt
+err.txt
+pid.txt
+.screenshot_gui.py
+.debug_gui.py
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
