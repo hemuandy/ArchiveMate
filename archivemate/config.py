@@ -16,16 +16,13 @@ from typing import Any
 from . import CONFIG_SCHEMA_VERSION, app_paths
 from .errors import ConfigError
 from .fsutil import BATCH_BYTES, BLOCK_BYTES, WARN_BYTES
+from .schedule import SCHEDULE_CHOICES, SCHEDULE_KEYS
 
-#: 定时同步可选间隔（分钟），0 表示关闭。
-SYNC_INTERVAL_CHOICES: tuple[tuple[int, str], ...] = (
-    (0, "关闭"),
-    (5, "每 5 分钟"),
-    (15, "每 15 分钟"),
-    (30, "每 30 分钟"),
-    (60, "每 1 小时"),
-    (1440, "每天"),
-)
+#: 定时同步档位：关闭 / 每天 0 点 / 每周一 0 点 / 每月 1 号 0 点（见 schedule.py）。
+SYNC_SCHEDULE_CHOICES: tuple[tuple[str, str], ...] = SCHEDULE_CHOICES
+
+#: 旧版本用「每 N 分钟」，读旧配置时只要开过就折算成「每天 0 点」。
+_LEGACY_INTERVAL_KEY = "sync_interval_minutes"
 
 DEFAULT_FILE_TYPES = (".pdf", ".ppt", ".pptx", ".doc", ".docx")
 
@@ -147,7 +144,7 @@ class Config:
     watch_folders: list[str] = field(default_factory=list)
     file_types: list[str] = field(default_factory=lambda: list(DEFAULT_FILE_TYPES))
     archive_folder: str = ""
-    sync_interval_minutes: int = 0
+    sync_schedule: str = "off"          # off | daily | weekly | monthly
     date_source: str = "mtime"          # mtime | now
     stability_seconds: float = 3.0
     poll_interval_seconds: float = 5.0
@@ -185,8 +182,7 @@ class Config:
         cfg.watch_folders = _as_str_list(data.get("watch_folders"), cfg.watch_folders)
         cfg.file_types = _as_str_list(data.get("file_types"), cfg.file_types)
         cfg.archive_folder = _as_str(data.get("archive_folder"), cfg.archive_folder)
-        cfg.sync_interval_minutes = _as_int(
-            data.get("sync_interval_minutes"), cfg.sync_interval_minutes)
+        cfg.sync_schedule = _as_schedule(data)
         cfg.date_source = _as_str(data.get("date_source"), cfg.date_source)
         cfg.stability_seconds = _as_float(
             data.get("stability_seconds"), cfg.stability_seconds)
@@ -249,9 +245,8 @@ class Config:
         self.archive_folder = _expand(self.archive_folder) if self.archive_folder else ""
         if self.date_source not in ("mtime", "now"):
             self.date_source = "mtime"
-        valid_intervals = {m for m, _ in SYNC_INTERVAL_CHOICES}
-        if self.sync_interval_minutes not in valid_intervals:
-            self.sync_interval_minutes = 0
+        if self.sync_schedule not in SCHEDULE_KEYS:
+            self.sync_schedule = "off"
         self.stability_seconds = max(0.5, float(self.stability_seconds))
         self.poll_interval_seconds = max(1.0, float(self.poll_interval_seconds))
         self.git.retry_count = max(1, int(self.git.retry_count))
@@ -266,10 +261,10 @@ class Config:
     # ---------- 便捷查询 ----------
 
     def interval_label(self) -> str:
-        for minutes, label in SYNC_INTERVAL_CHOICES:
-            if minutes == self.sync_interval_minutes:
-                return label
-        return "关闭"
+        """定时同步档位的界面文案。"""
+        from .schedule import schedule_label
+
+        return schedule_label(self.sync_schedule)
 
     def matches_type(self, filename: str) -> bool:
         suffix = Path(filename).suffix.lower()
@@ -349,6 +344,16 @@ def _as_str_list(value: Any, fallback: list[str]) -> list[str]:
     if not isinstance(value, list):
         return list(fallback)
     return [str(item) for item in value if isinstance(item, (str, int, float))]
+
+
+def _as_schedule(data: dict[str, Any]) -> str:
+    """读定时同步档位；没有这个字段就按旧版的「每 N 分钟」折算。"""
+    value = data.get("sync_schedule")
+    if isinstance(value, str) and value.strip() in SCHEDULE_KEYS:
+        return value.strip()
+    if _as_int(data.get(_LEGACY_INTERVAL_KEY), 0) > 0:
+        return "daily"
+    return "off"
 
 
 def _dedupe(items) -> list[str]:

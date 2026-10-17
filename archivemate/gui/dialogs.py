@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 
 from .. import CREDENTIAL_TARGET, credentials
 from ..config import (
-    DEFAULT_REPOSITORY_NAME, SYNC_INTERVAL_CHOICES, Config, normalize_extension,
+    DEFAULT_REPOSITORY_NAME, SYNC_SCHEDULE_CHOICES, Config, normalize_extension,
 )
 from ..fsutil import MiB, human_size
 from .theme import COLORS
@@ -159,9 +159,9 @@ class SettingsDialog(QDialog):
         sync_box = QGroupBox("同步", page)
         sync_form = QFormLayout(sync_box)
         self.interval_combo = QComboBox(sync_box)
-        for minutes, label in SYNC_INTERVAL_CHOICES:
-            self.interval_combo.addItem(label, minutes)
-        index = self.interval_combo.findData(self._config.sync_interval_minutes)
+        for key, label in SYNC_SCHEDULE_CHOICES:
+            self.interval_combo.addItem(label, key)
+        index = self.interval_combo.findData(self._config.sync_schedule)
         self.interval_combo.setCurrentIndex(index if index >= 0 else 0)
         self.date_combo = QComboBox(sync_box)
         self.date_combo.addItem("按文件修改日期（推荐）", "mtime")
@@ -359,7 +359,7 @@ class SettingsDialog(QDialog):
         repo.remote_url = self.remote_edit.text().strip()
 
         config.archive_folder = self.archive_edit.text().strip()
-        config.sync_interval_minutes = int(self.interval_combo.currentData())
+        config.sync_schedule = str(self.interval_combo.currentData() or "off")
         config.date_source = str(self.date_combo.currentData())
         config.git.proxy = self.proxy_edit.text().strip()
         config.git.ssl_backend = str(self.ssl_combo.currentData() or "")

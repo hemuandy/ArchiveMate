@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -268,18 +269,34 @@ class TestMainWindow(unittest.TestCase):
         self.assertEqual(self.dialog_titles("ask"), ["还不能同步"])
         self.assertFalse(self.service.syncing)
 
-    def test_interval_change_updates_config_and_timer(self):
-        index = self.window.interval_combo.findData(15)
+    def test_schedule_change_updates_config_and_timer(self):
+        index = self.window.interval_combo.findData("daily")
         self.window.interval_combo.setCurrentIndex(index)
 
-        self.assertEqual(self.service.config.sync_interval_minutes, 15)
+        self.assertEqual(self.service.config.sync_schedule, "daily")
         self.assertTrue(self.window._auto_timer.isActive())
-        self.assertEqual(self.window._auto_timer.interval(), 15 * 60 * 1000)
+        due = self.window._auto_due
+        self.assertIsNotNone(due)
+        self.assertEqual((due.hour, due.minute, due.second), (0, 0, 0))
+        self.assertIn(due.strftime("%Y-%m-%d 00:00"), self.window.schedule_hint.text())
 
         self.window.interval_combo.setCurrentIndex(
-            self.window.interval_combo.findData(0))
-        self.assertEqual(self.service.config.sync_interval_minutes, 0)
+            self.window.interval_combo.findData("off"))
+        self.assertEqual(self.service.config.sync_schedule, "off")
         self.assertFalse(self.window._auto_timer.isActive())
+        self.assertIsNone(self.window._auto_due)
+
+    def test_due_schedule_triggers_a_sync_and_rearms(self):
+        self.window.interval_combo.setCurrentIndex(
+            self.window.interval_combo.findData("weekly"))
+        # 把「到点时刻」拨到过去，模拟定时器醒来后发现该跑了
+        self.window._auto_due = datetime.now() - timedelta(seconds=1)
+        self.window._on_schedule_tick()
+
+        self.assertGreater(self.window._auto_due, datetime.now())
+        self.assertEqual(self.window._auto_due.weekday(), 0)
+        self.assertIn(self.window._auto_due.strftime("%Y-%m-%d 00:00"),
+                      self.window.schedule_hint.text())
 
     def test_watch_folder_edit_persists_to_disk(self):
         extra = self.base / "extra"

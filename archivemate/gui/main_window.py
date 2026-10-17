@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QUrl
@@ -13,13 +14,14 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QFileDialog, QFrame, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
-    QPlainTextEdit, QPushButton, QSplitter, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QPlainTextEdit, QPushButton, QScrollArea, QSplitter, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .. import APP_DISPLAY_NAME, __version__, app_paths, classify
-from ..config import SYNC_INTERVAL_CHOICES
+from ..config import SYNC_SCHEDULE_CHOICES
 from ..fsutil import human_size
+from ..schedule import next_run, schedule_label
 from ..service import (
     EVENT_LOG, EVENT_QUEUE, EVENT_STATUS, EVENT_SYNC_DONE, EVENT_SYNC_START,
     ArchiveMateService,
@@ -33,6 +35,9 @@ QUEUE_COLUMNS = ("文件", "目标位置", "大小", "来源", "状态")
 
 
 class MainWindow(QMainWindow):
+    #: 定时同步的检查粒度：每分钟确认一次「到点了没」。
+    _SCHEDULE_TICK_MS = 60_000
+
     def __init__(self, service: ArchiveMateService | None = None, parent=None) -> None:
         super().__init__(parent)
         self.service = service or ArchiveMateService()
@@ -55,8 +60,13 @@ class MainWindow(QMainWindow):
         self._pump.timeout.connect(self._drain_events)
         self._pump.start()
 
+        # 定时同步：不是固定间隔，而是「到点才跑」（每天 / 每周一 / 每月 1 号的 0 点）。
+        # 用一个每分钟醒一次的定时器盯着目标时刻，避免 QTimer 毫秒数溢出
+        # （每月一次 ≈ 2.6e9 ms，超过 int32 上限）。
         self._auto_timer = QTimer(self)
-        self._auto_timer.timeout.connect(self._auto_sync)
+        self._auto_timer.setInterval(self._SCHEDULE_TICK_MS)
+        self._auto_timer.timeout.connect(self._on_schedule_tick)
+        self._auto_due: datetime | None = None
 
         self._load_config_into_ui()
         self._refresh_queue()
@@ -126,10 +136,14 @@ class MainWindow(QMainWindow):
         interval_row = QHBoxLayout()
         interval_row.addWidget(QLabel("定时同步", self.sync_box))
         self.interval_combo = QComboBox(self.sync_box)
-        for minutes, label in SYNC_INTERVAL_CHOICES:
-            self.interval_combo.addItem(label, minutes)
+        for key, label in SYNC_SCHEDULE_CHOICES:
+            self.interval_combo.addItem(label, key)
         interval_row.addWidget(self.interval_combo, 1)
         sync_layout.addLayout(interval_row)
+        self.schedule_hint = QLabel("", self.sync_box)
+        self.schedule_hint.setObjectName("hint")
+        self.schedule_hint.setWordWrap(True)
+        sync_layout.addWidget(self.schedule_hint)
 
         self.archive_box = QGroupBox("归档文件夹", left)
         archive_layout = QVBoxLayout(self.archive_box)
@@ -150,11 +164,17 @@ class MainWindow(QMainWindow):
         archive_layout.addWidget(self.archive_label)
         archive_layout.addLayout(archive_buttons)
 
-        left_layout.addWidget(self.watch_box, 1)
-        left_layout.addWidget(self.types_box, 1)
+        left_layout.addWidget(self.watch_box)
+        left_layout.addWidget(self.types_box)
         left_layout.addWidget(self.sync_box)
         left_layout.addWidget(self.archive_box)
+        left_layout.addStretch(1)
         left.setMaximumWidth(330)
+        # 两个列表别把左栏撑满，留出空间给下面的同步与归档
+        self.watch_editor.list.setMinimumHeight(84)
+        self.watch_editor.list.setMaximumHeight(100)
+        self.types_editor.list.setMinimumHeight(84)
+        self.types_editor.list.setMaximumHeight(100)
 
         right = QWidget(central)
         right_layout = QVBoxLayout(right)
@@ -216,8 +236,16 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(1, 1)
         right_layout.addWidget(self.splitter, 1)
 
+        # 左栏内容比窗口高时要能滚动，否则底部的归档按钮会被切掉
+        left_scroll = QScrollArea(central)
+        left_scroll.setWidget(left)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setMaximumWidth(346)
+
         body = QSplitter(Qt.Orientation.Horizontal, central)
-        body.addWidget(left)
+        body.addWidget(left_scroll)
         body.addWidget(right)
         body.setStretchFactor(0, 0)
         body.setStretchFactor(1, 1)
@@ -254,7 +282,7 @@ class MainWindow(QMainWindow):
         config = self.service.config
         self.watch_editor.set_values(config.watch_folders)
         self.types_editor.set_values(config.file_types)
-        index = self.interval_combo.findData(config.sync_interval_minutes)
+        index = self.interval_combo.findData(config.sync_schedule)
         if index >= 0 and index != self.interval_combo.currentIndex():
             blocked = self.interval_combo.blockSignals(True)
             self.interval_combo.setCurrentIndex(index)
@@ -433,19 +461,38 @@ class MainWindow(QMainWindow):
     def _on_interval_changed(self) -> None:
         if not self._ready:
             return
-        minutes = int(self.interval_combo.currentData())
-        self.service.config.sync_interval_minutes = minutes
+        schedule = str(self.interval_combo.currentData())
+        self.service.config.sync_schedule = schedule
         self.service.apply_config(self.service.config)
         self._apply_interval()
-        label = dict(SYNC_INTERVAL_CHOICES).get(minutes, "")
-        self._log(f"定时同步已设置为：{label}")
+        self._log(f"定时同步已设置为：{schedule_label(schedule)}")
 
     def _apply_interval(self) -> None:
-        minutes = int(self.service.config.sync_interval_minutes)
-        if minutes > 0:
-            self._auto_timer.start(max(1, minutes) * 60 * 1000)
-        else:
+        """按当前档位重新计算下一次同步时刻并起停定时器。"""
+        schedule = self.service.config.sync_schedule
+        self._auto_due = next_run(schedule)
+        self.schedule_hint.setText(self._schedule_hint())
+        if self._auto_due is None:
             self._auto_timer.stop()
+        elif not self._auto_timer.isActive():
+            self._auto_timer.start()
+
+    def _schedule_hint(self) -> str:
+        """左栏那一行提示，要短：占两行就会把归档按钮挤出可视区。"""
+        if self._auto_due is None:
+            return "定时同步已关闭"
+        return f"下次同步 {self._auto_due.strftime('%Y-%m-%d %H:%M')}"
+
+    def _on_schedule_tick(self) -> None:
+        due = self._auto_due
+        if due is None:
+            self._auto_timer.stop()
+            return
+        if datetime.now() >= due:
+            # 先排下一班，再干活：同步可能要跑几分钟，不能因此漏掉下一次
+            self._auto_due = next_run(self.service.config.sync_schedule)
+            self.schedule_hint.setText(self._schedule_hint())
+            self._auto_sync()
 
     def _auto_sync(self) -> None:
         if self.service.syncing:
@@ -584,6 +631,7 @@ class MainWindow(QMainWindow):
         self.service.apply_config(config)
         self._load_config_into_ui()
         self._refresh_archive_label()
+        self._apply_interval()
         self._log("首次设置已完成，可以开始用了。")
 
     # ------------------------------------------------------------------

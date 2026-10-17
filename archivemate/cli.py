@@ -19,9 +19,10 @@ import time
 from pathlib import Path
 
 from . import __version__, app_paths, classify, credentials, logging_setup
-from .config import (SYNC_INTERVAL_CHOICES, Config,
+from .config import (SYNC_SCHEDULE_CHOICES, Config,
                      load as load_config, save as save_config)
 from .fsutil import human_size
+from .schedule import SCHEDULE_KEYS, schedule_label
 from .tracker import ORIGIN_LABELS, STATUS_LABELS
 
 EXIT_OK = 0
@@ -98,7 +99,7 @@ def cmd_status(args, service) -> int:
             "archive_folder": cfg.archive_folder,
             "watch_folders": cfg.watch_folders,
             "file_types": cfg.file_types,
-            "sync_interval_minutes": cfg.sync_interval_minutes,
+            "sync_schedule": cfg.sync_schedule,
             "has_token": bool(service.engine.token),
             "queue": [
                 {
@@ -143,7 +144,7 @@ def cmd_status(args, service) -> int:
         ("监控文件夹", f"{len(cfg.watch_folders)} 个"),
         ("目标类型", " ".join(cfg.file_types) or "（空）"),
         ("归档文件夹", cfg.archive_folder or "（未设置）"),
-        ("同步间隔", cfg.interval_label()),
+        ("定时同步", cfg.interval_label()),
     ])
     for raw, ok, note in service.watch_folder_status():
         _echo(f"    {'✓' if ok else '✗'} {raw}  — {note}")
@@ -362,15 +363,12 @@ def _apply_setting(cfg: Config, key: str, value: str) -> str:
     if key == "archive_folder":
         cfg.archive_folder = value
         return ""
-    if key == "sync_interval":
-        try:
-            minutes = int(value)
-        except ValueError:
-            return "sync_interval 需要是分钟数"
-        if minutes not in dict(SYNC_INTERVAL_CHOICES):
-            allowed = ", ".join(str(m) for m, _ in SYNC_INTERVAL_CHOICES)
-            return f"sync_interval 只能是：{allowed}"
-        cfg.sync_interval_minutes = minutes
+    if key in ("sync_schedule", "sync_interval"):
+        value = value.strip().lower()
+        if value not in SCHEDULE_KEYS:
+            allowed = ", ".join(SCHEDULE_KEYS)
+            return f"{key} 只能是：{allowed}"
+        cfg.sync_schedule = value
         return ""
     if key == "repository":
         if "/" not in value:
@@ -466,8 +464,8 @@ def cmd_init(args, service) -> int:
         cfg.watch_folders = [str(Path(p).expanduser()) for p in args.watch]
     if args.types:
         cfg.file_types = [classify.normalize_extension(t) for t in args.types]
-    if args.interval is not None:
-        cfg.sync_interval_minutes = args.interval
+    if args.schedule is not None:
+        cfg.sync_schedule = args.schedule
     if args.proxy is not None:
         cfg.git.proxy = args.proxy
     cfg.normalize()
@@ -563,7 +561,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--archive", metavar="DIR")
     p.add_argument("--watch", action="append", metavar="DIR")
     p.add_argument("--types", nargs="+")
-    p.add_argument("--interval", type=int)
+    p.add_argument("--schedule", choices=list(SCHEDULE_KEYS),
+                   help="定时同步：off / daily（每天 0 点）/ weekly（周一 0 点）/ monthly（每月 1 号 0 点）")
     p.add_argument("--proxy")
     p.set_defaults(func=cmd_init)
 

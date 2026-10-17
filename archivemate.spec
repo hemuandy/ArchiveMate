@@ -158,7 +158,7 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "ArchiveMate",
             "CFBundleDisplayName": "ArchiveMate 归巢",
-            "CFBundleShortVersionString": "1.2.0",
+            "CFBundleShortVersionString": "1.3.0",
             "NSHighResolutionCapable": True,
             "LSMinimumSystemVersion": "10.15",
         },

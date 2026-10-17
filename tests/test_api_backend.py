@@ -363,5 +363,42 @@ class TestBackendSelection(unittest.TestCase):
         self.assertEqual(type(backend).__name__, "ApiGitBackend")
 
 
+class TestOverwriteKeepingPath(unittest.TestCase):
+    """同名文件要覆盖，不是改名：树里必须用**原来的路径**再写一次。
+
+    在线接口建树时给同一个 path 就是替换内容（Git 树本来就以路径为键），
+    所以这里要钉住「路径没被改」和「没有额外请求去删旧文件」。
+    """
+
+    def setUp(self) -> None:
+        self.work = _mkdtemp("ow")
+        self.addCleanup(shutil.rmtree, self.work, True)
+
+    def test_same_path_is_rewritten_not_renamed(self) -> None:
+        pdf = self.work / "同名.pdf"
+        pdf.write_bytes(b"second version")
+        client = _FakeClient({
+            ("POST", "/repos/owner/repo/git/blobs"): {"sha": "blob-2"},
+            ("POST", "/repos/owner/repo/git/trees"): {"sha": "tree-2"},
+            ("POST", "/repos/owner/repo/git/commits"): {"sha": "commit-2"},
+        })
+        backend = _backend(client)
+        backend._base_tree = "tree-1"
+        backend._base_commit = "commit-1"
+
+        sha = backend.build_commit(
+            [FileToCommit(pdf, "2026/10/pdf/同名.pdf")], "add: 覆盖")
+
+        self.assertEqual(sha, "commit-2")
+        tree_payload = client.calls[1][2]
+        # 叠在基线树上 + 路径原样 → Git 语义里就是「替换这一项」
+        self.assertEqual(tree_payload["base_tree"], "tree-1")
+        entry = tree_payload["tree"][0]
+        self.assertEqual(entry["path"], "2026/10/pdf/同名.pdf")
+        self.assertNotIn("(2)", entry["path"])
+        # 覆盖不该额外发 DELETE 之类的请求
+        self.assertEqual([c[0] for c in client.calls], ["POST", "POST", "POST"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

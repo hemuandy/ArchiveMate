@@ -3,8 +3,8 @@
 运行时依赖：Python 3.10+ 与 PySide6（仅 GUI 需要）。核心逻辑仅用标准库。
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 APP_NAME = "ArchiveMate"
 APP_DISPLAY_NAME = "ArchiveMate 归巢"
 CREDENTIAL_TARGET = "ArchiveMate/github-token"
-CONFIG_SCHEMA_VERSION = 1
+CONFIG_SCHEMA_VERSION = 2

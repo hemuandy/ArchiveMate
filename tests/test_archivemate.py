@@ -32,6 +32,9 @@ from archivemate.fsutil import (  # noqa: E402
     unique_path,
 )
 from archivemate.git_backend import GitBackend, find_git  # noqa: E402
+from archivemate.schedule import (  # noqa: E402
+    describe_next, next_run, schedule_label,
+)
 from archivemate.sync import (  # noqa: E402
     build_commit_message, chunk_by_size, unique_dest_rel,
 )
@@ -211,9 +214,23 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(again.file_types, cfg.file_types)
         self.assertEqual(again.repository.branch, cfg.repository.branch)
 
-    def test_bad_interval_falls_back(self):
-        cfg = Config.from_dict({"sync_interval_minutes": 7})
-        self.assertEqual(cfg.sync_interval_minutes, 0)
+    def test_bad_schedule_falls_back(self):
+        cfg = Config.from_dict({"sync_schedule": "every-second"})
+        self.assertEqual(cfg.sync_schedule, "off")
+
+    def test_legacy_interval_becomes_daily(self):
+        # 老配置里开着「每 15 分钟」，升级后折算成每天 0 点，不能变回关闭
+        self.assertEqual(Config.from_dict({"sync_interval_minutes": 15}).sync_schedule,
+                         "daily")
+        self.assertEqual(Config.from_dict({"sync_interval_minutes": 0}).sync_schedule,
+                         "off")
+
+    def test_schedule_round_trip(self):
+        cfg = Config()
+        cfg.sync_schedule = "weekly"
+        again = Config.from_dict(cfg.to_dict())
+        self.assertEqual(again.sync_schedule, "weekly")
+        self.assertEqual(again.interval_label(), "每周一 0 点")
 
     def test_empty_types_get_defaults(self):
         cfg = Config.from_dict({"file_types": []})
@@ -314,6 +331,60 @@ class TestTracker(unittest.TestCase):
         self.target.unlink()
         self.assertEqual(tracker.prune_seen(), 1)
         self.assertEqual(tracker.seen, {})
+
+
+# ======================================================================
+# 定时同步的时刻计算
+# ======================================================================
+
+
+class TestSchedule(unittest.TestCase):
+    def test_off_has_no_next_run(self):
+        self.assertIsNone(next_run("off", datetime(2026, 10, 17, 9, 0)))
+        self.assertIsNone(next_run("nonsense"))
+        self.assertEqual(schedule_label("off"), "关闭")
+        self.assertIn("关闭", describe_next("off"))
+
+    def test_daily_is_next_midnight(self):
+        self.assertEqual(next_run("daily", datetime(2026, 10, 17, 9, 30)),
+                         datetime(2026, 10, 18, 0, 0))
+        # 正好在 0 点整：给的是「下一个」0 点，不会刚跑完又要跑
+        self.assertEqual(next_run("daily", datetime(2026, 10, 17, 0, 0)),
+                         datetime(2026, 10, 18, 0, 0))
+
+    def test_weekly_is_next_monday_midnight(self):
+        # 2026-10-17 是周六 → 下一个周一是 10-19
+        self.assertEqual(next_run("weekly", datetime(2026, 10, 17, 12, 0)),
+                         datetime(2026, 10, 19, 0, 0))
+        # 周一当天白天 → 下周一
+        self.assertEqual(next_run("weekly", datetime(2026, 10, 19, 8, 0)),
+                         datetime(2026, 10, 26, 0, 0))
+        # 周一 0 点整 → 下周一
+        self.assertEqual(next_run("weekly", datetime(2026, 10, 19, 0, 0)),
+                         datetime(2026, 10, 26, 0, 0))
+
+    def test_monthly_is_next_first_day(self):
+        self.assertEqual(next_run("monthly", datetime(2026, 10, 17, 9, 0)),
+                         datetime(2026, 11, 1, 0, 0))
+        # 跨年
+        self.assertEqual(next_run("monthly", datetime(2026, 12, 15, 9, 0)),
+                         datetime(2027, 1, 1, 0, 0))
+        # 1 号 0 点整 → 下个月 1 号
+        self.assertEqual(next_run("monthly", datetime(2026, 11, 1, 0, 0)),
+                         datetime(2026, 12, 1, 0, 0))
+
+    def test_describe_next_mentions_the_moment(self):
+        text = describe_next("daily", datetime(2026, 10, 17, 9, 0))
+        self.assertIn("2026-10-18 00:00", text)
+        self.assertIn("每天 0 点", text)
+
+    def test_all_schedules_land_on_midnight(self):
+        now = datetime(2026, 10, 17, 13, 45, 30)
+        for key in ("daily", "weekly", "monthly"):
+            moment = next_run(key, now)
+            self.assertIsNotNone(moment)
+            self.assertEqual((moment.hour, moment.minute, moment.second), (0, 0, 0))
+            self.assertGreater(moment, now)
 
 
 # ======================================================================
@@ -463,6 +534,13 @@ class TestEndToEnd(unittest.TestCase):
         raw = self._git("ls-tree", "-r", "-z", "--name-only", "main")
         return [entry for entry in raw.split("\0") if entry]
 
+    def _remote_bytes(self, rel_path: str) -> bytes:
+        """取远端某个路径的文件内容，用来确认「覆盖」不是「留着旧版本」。"""
+        return subprocess.run(
+            [GIT, f"--git-dir={self.remote}", "cat-file", "-p", f"main:{rel_path}"],
+            check=True, capture_output=True,
+        ).stdout
+
     def test_full_pipeline(self):
         self._write("数学课件.pptx", b"powerpoint bytes")
         self._write("作文模板.docx", b"word bytes")
@@ -536,13 +614,13 @@ class TestEndToEnd(unittest.TestCase):
         self.assertFalse(outcome.ok)
         self.assertEqual(self._remote_paths(), [])
 
-    def test_duplicate_gets_renamed_not_overwritten(self):
+    def test_same_name_overwrites_instead_of_renaming(self):
         first = self._write("同名.pdf", b"first version")
         self.service.ingest(first)
         self.service.sync_blocking()
         self.assertIn("2026/10/pdf/同名.pdf", self._remote_paths())
 
-        # 再放一个同名但内容不同的文件（模拟重新下载）
+        # 再放一个同名但内容不同的文件（模拟重新下载）：同名就要覆盖，不要留 (2)
         self._write("同名.pdf", b"second version, different")
         self.service.ingest(self.downloads / "同名.pdf")
         outcome = self.service.sync_blocking()
@@ -550,7 +628,24 @@ class TestEndToEnd(unittest.TestCase):
 
         tree = self._remote_paths()
         self.assertIn("2026/10/pdf/同名.pdf", tree)
-        self.assertIn("2026/10/pdf/同名 (2).pdf", tree)
+        self.assertNotIn("2026/10/pdf/同名 (2).pdf", tree)
+        self.assertIn(b"second version, different", self._remote_bytes("2026/10/pdf/同名.pdf"))
+
+    def test_same_name_in_one_batch_still_gets_distinct_paths(self):
+        # 同一批里两个不同文件撞名：不能互相覆盖，否则会静默丢一个
+        a = self._write("撞名.pdf", b"from downloads")
+        self.service.ingest(a)
+        other = self.base / "拖拽"
+        other.mkdir(parents=True, exist_ok=True)
+        second = other / "撞名.pdf"
+        second.write_bytes(b"from drag")
+        self.service.ingest(second)
+
+        outcome = self.service.sync_blocking()
+        self.assertTrue(outcome.ok, outcome.message)
+        tree = self._remote_paths()
+        self.assertIn("2026/10/pdf/撞名.pdf", tree)
+        self.assertIn("2026/10/pdf/撞名 (2).pdf", tree)
 
     def test_retry_after_source_deleted(self):
         path = self._write("会消失.pdf", b"bye")

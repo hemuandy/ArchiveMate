@@ -363,17 +363,20 @@ class SyncEngine:
             self._log("同步已取消，队列内容原样保留。")
             return outcome
 
-        # 与远端已有文件排重：仓库里已经有同路径文件时改名，不要覆盖历史版本
+        # 与远端已有文件同名时直接覆盖：Git 树里同路径就是替换内容，
+        # 用户要的是「仓库里永远是最新那份」，而不是越积越多的 xxx (2).pdf。
         existing = backend.existing_paths()
-        reserved = {other.dest_rel for other in (*candidates, *pre_blocked)}
+        # 但同一批里两个文件互相撞名必须错开，否则会静默丢掉一个。
+        claimed: set[str] = set()
         for item in ready:
-            # 自己占用的路径不算冲突，但仓库里已存在的同名文件必须改名
-            taken = existing | (reserved - {item.dest_rel})
-            resolved = unique_dest_rel(item.dest_rel, taken)
-            if resolved != item.dest_rel:
-                self._log(f"仓库中已有同名文件，重命名为 {Path(resolved).name}")
+            wanted = item.dest_rel
+            resolved = unique_dest_rel(wanted, claimed)
+            if resolved != wanted:
+                self._log(f"队列中有同名文件，重命名为 {Path(resolved).name}")
                 item.dest_rel = resolved
-            existing.add(item.dest_rel)
+            elif wanted in existing:
+                self._log(f"仓库中已有 {Path(wanted).name}，本次用新文件覆盖它。")
+            claimed.add(item.dest_rel)
 
         batches = chunk_by_size(ready, self.config.limits.batch_bytes)
         if len(batches) > 1:
