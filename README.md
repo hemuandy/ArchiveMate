@@ -74,6 +74,9 @@ pwsh -NoProfile -File build.ps1
 | 同步可中断 | `sync.py: SyncEngine.cancel` / `service.py: cancel_sync` / `gui/main_window.py: _cancel_sync` | 同步中显示「取消同步」，掐掉 git 进程，队列不丢 |
 | 无需多设备同步 | — | 单机设计，不做同步协议 |
 | 首次使用引导（非强制） | `gui/dialogs.py: OnboardingDialog` | 可跳过，之后在「设置」里随时改 |
+| 一键打开 GitHub 新建 Token 页面 | `gui/dialogs.py: open_token_page / TOKEN_CREATE_URL` | 引导页与设置页各一个按钮，跳 `https://github.com/settings/tokens/new` |
+| Token 即输即验 + 用户名自动填充 | `gui/dialogs.py: _ApiProbe / _auto_test_token` | 失焦或回车自动验一次，通过后把登录名填进「用户名」，失败显示红色原因 |
+| 仓库名留空兜底 `school-files` | `config.py: DEFAULT_REPOSITORY_NAME / resolved_name` | 保存的配置与实际调用的 API 都用这个默认值 |
 | 跨平台（Windows 优先） | 全部 | Windows 已实测；macOS / Linux 分支已写但未实机验证 |
 | 低资源占用 | `watcher.py` | 轮询式监控，默认 5 秒一轮，不常驻大内存 |
 
@@ -245,7 +248,7 @@ POST /git/blobs  →  POST /git/trees（带 base_tree）  →  POST /git/commits
 ```powershell
 $env:QT_QPA_PLATFORM = 'offscreen'
 python -m unittest discover -s tests
-# Ran 145 tests ... OK
+# Ran 159 tests ... OK
 ```
 
 - **核心逻辑**：分类规则、体积限制、配置读写、状态持久化、同步辅助函数、端到端流水线。
@@ -269,6 +272,9 @@ python -m unittest discover -s tests
   无仓库时的引导、定时器开关、设置对话框往返、首次引导，以及
   **界面调用 GitHub 客户端时的参数签名**（用 `autospec` 校验，防的是真实用户踩过的
   `takes 2 positional arguments but 3 were given`）。
+- **Token 便利功能**（`TestTokenHelpers`）：一键新建 Token 的地址、两个对话框里的按钮、
+  验证成功自动填用户名、验证失败显示红色原因且不覆盖手填的用户名、
+  输入完自动只验一次（短输入不发请求）、仓库名留空的兜底值。
 - 端到端用例用一个 `LocalOnlyBackend`：把「远端」直接指向本地 bare 仓库本身，
   跳过网络传输，但 blob / tree / commit message / 排重 / 归档 / 队列全部真实执行。
 
@@ -335,4 +341,17 @@ macOS 上 `archivemate.spec` 末尾已经带了 `.app` 的 `BUNDLE` 段（`sys.p
 
 ## 许可
 
-仅供学习与个人使用。
+本项目采用 **[PolyForm Noncommercial License 1.0.0](LICENSE)**，完整条款见仓库根目录的 `LICENSE`。
+
+简单说：
+
+- ✅ **免费**给个人使用——学生自己归档自己的课件、笔记、作业都没问题，也可以自行修改源码。
+- ✅ 学校、公益组织、政府机构等非营利机构的使用同样属于被许可的用途。
+- ❌ **禁止任何形式的商业用途**：不能拿去卖、不能预装进付费商品、不能作为商业服务的一部分、
+  不能靠它收费或变相收费。
+- ❌ **禁止倒卖**：不得把本软件或其修改版以任何形式转售、打包出售、或在收费渠道分发。
+- ⚠️ 分发时必须保留 `LICENSE` 与本文件中的 `Required Notice:` 版权声明。
+
+需要商业授权请另行联系作者。软件按「现状」提供，不附带任何担保。
+
+> Required Notice: Copyright 2026 hemuandy (https://github.com/hemuandy)

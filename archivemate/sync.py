@@ -176,8 +176,8 @@ class SyncEngine:
         elif (not force_git and self._use_api_backend()):
             backend = ApiGitBackend(
                 self.token or "",
-                self.config.repository.owner,
-                self.config.repository.name,
+                self.config.repository.owner.strip(),
+                self.config.repository.resolved_name(),
                 self.config.repository.branch,
                 proxy=self.config.git.proxy,
                 network_timeout=self.config.git.resolved_network_timeout(),
@@ -215,7 +215,7 @@ class SyncEngine:
         return bool(
             self.token
             and repository.owner.strip()
-            and repository.name.strip()
+            and repository.resolved_name()
             and repository.branch.strip()
         )
 

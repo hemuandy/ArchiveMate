@@ -235,6 +235,24 @@ class TestConfig(unittest.TestCase):
         self.assertFalse(cfg.matches_type("A.txt"))
         self.assertFalse(cfg.matches_type("noextension"))
 
+    def test_blank_repository_name_falls_back_to_default(self):
+        """仓库名留空不该变成「没配置」——新手最容易卡在这一栏。"""
+        from archivemate.config import DEFAULT_REPOSITORY_NAME
+
+        cfg = Config()
+        cfg.repository.owner = "me"
+        cfg.repository.name = ""
+        self.assertEqual(cfg.repository.resolved_name(), DEFAULT_REPOSITORY_NAME)
+        self.assertEqual(cfg.repository.resolved_remote_url(),
+                         f"https://github.com/me/{DEFAULT_REPOSITORY_NAME}.git")
+        self.assertEqual(cfg.repository.slug, f"me/{DEFAULT_REPOSITORY_NAME}")
+        self.assertTrue(cfg.repository.is_configured())
+
+        # 但连用户名都没有时，仍然算未配置，不能凭空拼一个 URL 出来
+        cfg.repository.owner = ""
+        self.assertFalse(cfg.repository.is_configured())
+        self.assertEqual(cfg.repository.slug, "")
+
 
 # ======================================================================
 # 队列状态
@@ -1400,10 +1418,13 @@ class TestRunCommandNeverHangs(unittest.TestCase):
     def test_normal_command_captures_stdout_and_stderr(self):
         from archivemate.git_backend import run_command
 
+        # 子进程的 stdout 编码跟着系统区域设置走（中文 Windows 上是 GBK），
+        # 这里显式固定成 UTF-8，测的才是「管道字节原样透传」而不是本机代码页。
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
         result = run_command(
             [sys.executable, "-c",
              "import sys; sys.stdout.write('out-好'); sys.stderr.write('err')"],
-            env=dict(os.environ), timeout=60,
+            env=env, timeout=60,
         )
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout.decode("utf-8"), "out-好")

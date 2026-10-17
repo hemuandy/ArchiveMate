@@ -29,6 +29,9 @@ SYNC_INTERVAL_CHOICES: tuple[tuple[int, str], ...] = (
 
 DEFAULT_FILE_TYPES = (".pdf", ".ppt", ".pptx", ".doc", ".docx")
 
+#: 仓库名留空时的兜底值，界面提示里也用它举例。
+DEFAULT_REPOSITORY_NAME = "school-files"
+
 
 def _expand(path: str) -> str:
     return os.path.expanduser(os.path.expandvars(path))
@@ -57,13 +60,17 @@ class RepositoryConfig:
 
     @property
     def slug(self) -> str:
-        return f"{self.owner}/{self.name}" if self.owner and self.name else ""
+        return f"{self.owner}/{self.resolved_name()}" if self.owner else ""
+
+    def resolved_name(self) -> str:
+        """仓库名留空时的兜底值：新手最容易卡在「不知道该填什么」。"""
+        return self.name.strip() or DEFAULT_REPOSITORY_NAME
 
     def resolved_remote_url(self) -> str:
         if self.remote_url.strip():
             return self.remote_url.strip()
-        if self.owner and self.name:
-            return f"https://github.com/{self.owner}/{self.name}.git"
+        if self.owner.strip():
+            return f"https://github.com/{self.owner.strip()}/{self.resolved_name()}.git"
         return ""
 
     def is_configured(self) -> bool:

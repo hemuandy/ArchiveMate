@@ -642,6 +642,17 @@ def run(argv: list[str] | None = None) -> int:
               f"队列 {window.queue_table.rowCount()} 行 "
               f"屏幕 {screen.geometry().width() if screen else '?'}x"
               f"{screen.geometry().height() if screen else '?'}")
+        # 两个对话框是延迟导入的，PyInstaller 容易漏收，顺手确认它们也能建起来
+        from .dialogs import OnboardingDialog, SettingsDialog
+
+        config = window.service.config
+        settings = SettingsDialog(config, window)
+        onboarding = OnboardingDialog(config, window)
+        print(f"对话框已构建：设置「{settings.get_token_button.text()}」"
+              f" / 引导「{onboarding.get_token_button.text()}」")
+        for dialog in (settings, onboarding):
+            dialog.close()
+            dialog.deleteLater()
         window.close()
         return 0
 

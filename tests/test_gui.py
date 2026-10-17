@@ -25,6 +25,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from archivemate import app_paths  # noqa: E402
 from archivemate.config import Config  # noqa: E402
 from archivemate.git_backend import find_git  # noqa: E402
+from archivemate.gui.theme import COLORS  # noqa: E402
+
+COLORS_OK = COLORS["ok"]
+COLORS_ERROR = COLORS["error"]
 
 try:
     from PySide6.QtWidgets import QApplication
@@ -440,6 +444,199 @@ class TestDialogs(unittest.TestCase):
         dialog.ssl_combo.setCurrentIndex(dialog.ssl_combo.findData(""))
         dialog.apply_to(cfg)
         self.assertEqual(cfg.git.ssl_backend, "")
+
+
+class TestTokenHelpers(unittest.TestCase):
+    """Token 相关的三个便利功能：一键建 Token、自动校验、用户名回填。"""
+
+    def setUp(self):
+        self.base = _mkdtemp("tok-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self._old_home = os.environ.get("ARCHIVEMATE_HOME")
+        os.environ["ARCHIVEMATE_HOME"] = str(self.base / "home")
+        (self.base / "home").mkdir(parents=True, exist_ok=True)
+        app_paths.reset_cache()
+        _app()
+
+    def tearDown(self):
+        if self._old_home is None:
+            os.environ.pop("ARCHIVEMATE_HOME", None)
+        else:
+            os.environ["ARCHIVEMATE_HOME"] = self._old_home
+        app_paths.reset_cache()
+
+    # -- 一键新建 Token -------------------------------------------------
+
+    def test_token_url_points_at_github_token_page(self):
+        from archivemate.gui import dialogs
+
+        self.assertEqual(dialogs.TOKEN_CREATE_URL,
+                         "https://github.com/settings/tokens/new")
+
+    def test_onboarding_has_a_token_page_button(self):
+        from archivemate.gui import dialogs
+
+        cfg = Config.default()
+        dialog = dialogs.OnboardingDialog(cfg)
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertIn("Token", dialog.get_token_button.text())
+        with mock.patch.object(dialogs, "open_token_page",
+                               return_value=True) as opener:
+            dialog.get_token_button.click()
+        opener.assert_called_once_with()
+
+    def test_settings_has_a_token_page_button(self):
+        from archivemate.gui import dialogs
+
+        cfg = Config.default()
+        dialog = dialogs.SettingsDialog(cfg)
+        self.addCleanup(dialog.deleteLater)
+
+        with mock.patch.object(dialogs, "open_token_page",
+                               return_value=False) as opener:
+            dialog.get_token_button.click()
+        opener.assert_called_once_with()
+        # 浏览器打不开时必须给出可以手抄的地址，不能静默失败
+        self.assertIn(dialogs.TOKEN_CREATE_URL, dialog.token_status.text())
+
+    # -- 自动校验与用户名回填 -------------------------------------------
+
+    def test_probe_success_fills_in_the_username(self):
+        from archivemate.gui.dialogs import OnboardingDialog
+
+        cfg = Config.default()
+        cfg.onboarding_completed = False
+        dialog = OnboardingDialog(cfg)
+        self.addCleanup(dialog.deleteLater)
+        self.assertEqual(dialog.owner_edit.text(), "")
+
+        dialog._on_probe_done(True, "连接成功，已登录为 alice", "alice")
+
+        self.assertEqual(dialog.owner_edit.text(), "alice")
+        self.assertIn("✓", dialog.token_status.text())
+        self.assertFalse(dialog.token_status.isHidden())
+        self.assertIn(COLORS_OK, dialog.token_status.styleSheet())
+
+    def test_probe_failure_is_red_and_leaves_username_alone(self):
+        from archivemate.gui.dialogs import OnboardingDialog
+
+        cfg = Config.default()
+        dialog = OnboardingDialog(cfg)
+        self.addCleanup(dialog.deleteLater)
+
+        dialog._on_probe_done(False, "Token 无效或已过期，请重新填写。", "")
+
+        self.assertIn("✗", dialog.token_status.text())
+        self.assertIn("Token 无效", dialog.token_status.text())
+        self.assertIn(COLORS_ERROR, dialog.token_status.styleSheet())
+        self.assertFalse(dialog.token_status.isHidden())
+        self.assertEqual(dialog.owner_edit.text(), "")
+
+    def test_probe_does_not_overwrite_a_hand_typed_owner(self):
+        from archivemate.gui.dialogs import OnboardingDialog
+
+        cfg = Config.default()
+        dialog = OnboardingDialog(cfg)
+        self.addCleanup(dialog.deleteLater)
+        dialog.owner_edit.setText("my-org")
+
+        dialog._on_probe_done(True, "连接成功，已登录为 alice", "alice")
+
+        self.assertEqual(dialog.owner_edit.text(), "my-org")
+
+    def test_autofilled_owner_can_be_replaced_by_a_later_probe(self):
+        from archivemate.gui.dialogs import OnboardingDialog
+
+        cfg = Config.default()
+        dialog = OnboardingDialog(cfg)
+        self.addCleanup(dialog.deleteLater)
+
+        dialog._on_probe_done(True, "ok", "alice")
+        dialog.token_edit.setText("ghp_second")
+        dialog._on_probe_done(True, "ok", "bob")
+
+        self.assertEqual(dialog.owner_edit.text(), "bob")
+
+    def test_typing_a_token_triggers_a_probe_once(self):
+        from archivemate.gui import dialogs
+
+        cfg = Config.default()
+        dialog = dialogs.OnboardingDialog(cfg)
+        self.addCleanup(dialog.deleteLater)
+        token = "ghp_" + "a" * 36
+
+        with mock.patch.object(dialogs, "_ApiProbe") as probe_cls:
+            dialog.token_edit.setText(token)
+            dialog._auto_test_token()
+            dialog._auto_test_token()      # 失焦两次不应该发两个请求
+
+        probe_cls.assert_called_once()
+        self.assertEqual(probe_cls.call_args[0][0], token)
+
+    def test_short_input_does_not_hit_the_network(self):
+        from archivemate.gui import dialogs
+
+        cfg = Config.default()
+        dialog = dialogs.OnboardingDialog(cfg)
+        self.addCleanup(dialog.deleteLater)
+
+        with mock.patch.object(dialogs, "_ApiProbe") as probe_cls:
+            dialog.token_edit.setText("oops")
+            dialog._auto_test_token()
+
+        probe_cls.assert_not_called()
+
+    # -- 仓库名兜底 -----------------------------------------------------
+
+    def test_blank_repository_name_falls_back_in_onboarding(self):
+        from archivemate.gui.dialogs import OnboardingDialog
+
+        cfg = Config.default()
+        dialog = OnboardingDialog(cfg)
+        self.addCleanup(dialog.deleteLater)
+        dialog.owner_edit.setText("alice")
+        dialog.name_edit.setText("   ")
+
+        dialog.apply_to(cfg)
+
+        self.assertEqual(cfg.repository.name, "school-files")
+        self.assertEqual(cfg.repository.resolved_remote_url(),
+                         "https://github.com/alice/school-files.git")
+
+    def test_blank_repository_name_falls_back_in_settings(self):
+        from archivemate.gui.dialogs import SettingsDialog
+
+        cfg = Config.default()
+        dialog = SettingsDialog(cfg)
+        self.addCleanup(dialog.deleteLater)
+        dialog.owner_edit.setText("alice")
+        dialog.name_edit.clear()
+
+        dialog.apply_to(cfg)
+
+        self.assertEqual(cfg.repository.name, "school-files")
+
+    def test_create_repository_uses_the_default_name(self):
+        import archivemate.github_api as api
+        from archivemate.gui.dialogs import OnboardingDialog
+
+        cfg = Config.default()
+        dialog = OnboardingDialog(cfg)
+        self.addCleanup(dialog.deleteLater)
+        dialog.token_edit.setText("ghp_fake")
+        dialog.name_edit.clear()
+
+        info = api.RepositoryInfo(owner="alice", name="school-files", private=True,
+                                  default_branch="main", clone_url="")
+        with mock.patch.object(api, "GitHubClient", autospec=True) as client_cls:
+            client_cls.return_value.create_repository.return_value = info
+            dialog._create_repository()
+
+        client_cls.return_value.create_repository.assert_called_once()
+        self.assertEqual(
+            client_cls.return_value.create_repository.call_args[0][0],
+            "school-files")
 
 
 class TestGitHubApiCallSites(unittest.TestCase):

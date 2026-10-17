@@ -43,11 +43,20 @@ EXCLUDES = [
 ]
 
 # ---------------------------------------------------------------- 图形界面版
+# 许可与说明文档一起塞进成品文件夹：PolyForm 要求分发时必须带上这些条款。
+DIST_DOCS = [
+    (str(path), ".") for path in (
+        ROOT / "LICENSE",
+        ROOT / "README.md",
+        ROOT / "docs" / "使用说明.md",
+    ) if path.exists()
+]
+
 gui_analysis = Analysis(
     [str(ROOT / "packaging" / "launcher.py")],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[],
+    datas=list(DIST_DOCS),
     hiddenimports=[
         # 这些是延迟导入的，PyInstaller 的静态分析看不到
         "archivemate.gui.main_window",
@@ -149,7 +158,7 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "ArchiveMate",
             "CFBundleDisplayName": "ArchiveMate 归巢",
-            "CFBundleShortVersionString": "1.1.0",
+            "CFBundleShortVersionString": "1.2.0",
             "NSHighResolutionCapable": True,
             "LSMinimumSystemVersion": "10.15",
         },

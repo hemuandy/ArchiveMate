@@ -339,9 +339,16 @@ class TestBackendSelection(unittest.TestCase):
         self.assertEqual(type(backend).__name__, "GitBackend")
 
     def test_falls_back_to_git_without_repository(self) -> None:
-        self.config.repository.name = ""
+        # 仓库名留空不算「没配置」：会兜底成 school-files。
+        self.config.repository.owner = ""
         self.assertEqual(
             type(self._engine("ghp_x").build_backend()).__name__, "GitBackend")
+
+    def test_blank_repository_name_uses_default(self) -> None:
+        self.config.repository.name = ""
+        backend = self._engine("ghp_x").build_backend()
+        self.assertEqual(type(backend).__name__, "ApiGitBackend")
+        self.assertEqual(backend.name, "school-files")
 
     def test_force_git_overrides_api(self) -> None:
         engine = self._engine("ghp_x")

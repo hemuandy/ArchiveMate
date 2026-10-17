@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
@@ -12,15 +13,25 @@ from PySide6.QtWidgets import (
 )
 
 from .. import CREDENTIAL_TARGET, credentials
-from ..config import SYNC_INTERVAL_CHOICES, Config, normalize_extension
+from ..config import (
+    DEFAULT_REPOSITORY_NAME, SYNC_INTERVAL_CHOICES, Config, normalize_extension,
+)
 from ..fsutil import MiB, human_size
 from .theme import COLORS
+
+#: 官方的新建 Token 页面。点按钮直接跳过去，省得用户自己找。
+TOKEN_CREATE_URL = "https://github.com/settings/tokens/new"
+
+
+def open_token_page() -> bool:
+    """用系统默认浏览器打开 GitHub 的新建 Token 页面。"""
+    return QDesktopServices.openUrl(QUrl(TOKEN_CREATE_URL))
 
 
 class _ApiProbe(QThread):
     """在后台线程里验证 Token 是否可用，避免卡住界面。"""
 
-    finished_probe = Signal(bool, str)
+    finished_probe = Signal(bool, str, str)
 
     def __init__(self, token: str, proxy: str, parent=None) -> None:
         super().__init__(parent)
@@ -32,9 +43,10 @@ class _ApiProbe(QThread):
             from ..github_api import GitHubClient
 
             user = GitHubClient(self.token, proxy=self.proxy, timeout=20).get_user()
-            self.finished_probe.emit(True, f"连接成功，已登录为 {user.login}")
+            login = getattr(user, "login", "") or ""
+            self.finished_probe.emit(True, f"连接成功，已登录为 {login}", login)
         except Exception as exc:  # 网络/权限问题都统一报给用户
-            self.finished_probe.emit(False, str(exc))
+            self.finished_probe.emit(False, str(exc), "")
 
 
 class SettingsDialog(QDialog):
@@ -107,10 +119,14 @@ class SettingsDialog(QDialog):
         token_layout.addLayout(row)
 
         actions = QHBoxLayout()
+        self.get_token_button = QPushButton("去 GitHub 获取 Token", token_box)
+        self.get_token_button.setToolTip(TOKEN_CREATE_URL)
+        self.get_token_button.clicked.connect(self._open_token_page)
         self.test_button = QPushButton("测试连接", token_box)
         self.test_button.clicked.connect(self._test_token)
         clear_button = QPushButton("清除已保存的 Token", token_box)
         clear_button.clicked.connect(self._clear_token)
+        actions.addWidget(self.get_token_button)
         actions.addWidget(self.test_button)
         actions.addWidget(clear_button)
         actions.addStretch(1)
@@ -272,6 +288,12 @@ class SettingsDialog(QDialog):
         if chosen:
             self.git_edit.setText(chosen)
 
+    def _open_token_page(self) -> None:
+        if not open_token_page():
+            msg = f"没能打开浏览器，请手动访问：{TOKEN_CREATE_URL}"
+            self.token_status.setText(msg)
+            self.token_status.setStyleSheet(f"color: {COLORS['warn']};")
+
     def _clear_token(self) -> None:
         try:
             credentials.delete_token(CREDENTIAL_TARGET)
@@ -294,11 +316,13 @@ class SettingsDialog(QDialog):
         self._probe.finished_probe.connect(self._on_probe_done)
         self._probe.start()
 
-    def _on_probe_done(self, ok: bool, message: str) -> None:
+    def _on_probe_done(self, ok: bool, message: str, login: str = "") -> None:
         self.test_button.setEnabled(True)
         color = COLORS["ok"] if ok else COLORS["error"]
         self.token_status.setText(("✓ " if ok else "✗ ") + message)
         self.token_status.setStyleSheet(f"color: {color};")
+        if ok and login and not self.owner_edit.text().strip():
+            self.owner_edit.setText(login)
 
     # ------------------------------------------------------------------
     # 结果
@@ -330,7 +354,7 @@ class SettingsDialog(QDialog):
         """把对话框里的内容写回配置对象。"""
         repo = config.repository
         repo.owner = self.owner_edit.text().strip()
-        repo.name = self.name_edit.text().strip()
+        repo.name = self.name_edit.text().strip() or DEFAULT_REPOSITORY_NAME
         repo.branch = self.branch_edit.text().strip() or "main"
         repo.remote_url = self.remote_edit.text().strip()
 
@@ -365,6 +389,9 @@ class OnboardingDialog(QDialog):
         self.setMinimumWidth(540)
 
         self._config = config.copy()
+        self._probe: _ApiProbe | None = None
+        self._probed_token = ""
+        self._autofilled_owner = ""
         try:
             self._token = credentials.get_token(CREDENTIAL_TARGET) or ""
         except Exception:
@@ -380,20 +407,41 @@ class OnboardingDialog(QDialog):
 
         token_box = QGroupBox("1. GitHub Token", self)
         token_layout = QVBoxLayout(token_box)
+        token_row = QHBoxLayout()
         self.token_edit = QLineEdit(self._token, token_box)
         self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.token_edit.setPlaceholderText("ghp_… 或 github_pat_…")
-        token_layout.addWidget(self.token_edit)
-        token_hint = QLabel(credentials.storage_hint(), token_box)
+        self.test_button = QPushButton("测试连接", token_box)
+        self.test_button.clicked.connect(self._test_token)
+        self.get_token_button = QPushButton("去 GitHub 获取 Token", token_box)
+        self.get_token_button.setToolTip(TOKEN_CREATE_URL)
+        self.get_token_button.clicked.connect(self._open_token_page)
+        token_row.addWidget(self.token_edit, 1)
+        token_row.addWidget(self.test_button)
+        token_row.addWidget(self.get_token_button)
+        token_layout.addLayout(token_row)
+
+        # Token 输完就自动验一次，省得用户不知道下一步该干嘛。
+        self.token_edit.editingFinished.connect(self._auto_test_token)
+
+        self.token_status = QLabel("", token_box)
+        self.token_status.setObjectName("hint")
+        self.token_status.setWordWrap(True)
+        self.token_status.setVisible(False)
+        token_layout.addWidget(self.token_status)
+
+        token_hint = QLabel(credentials.storage_hint() + " 权限只需勾选 repo。", token_box)
         token_hint.setObjectName("hint")
+        token_hint.setWordWrap(True)
         token_layout.addWidget(token_hint)
 
         repo_box = QGroupBox("2. 归档仓库", self)
         repo_form = QFormLayout(repo_box)
         self.owner_edit = QLineEdit(self._config.repository.owner, repo_box)
-        self.owner_edit.setPlaceholderText("GitHub 用户名")
+        self.owner_edit.setPlaceholderText("GitHub 用户名（验证 Token 后自动填入）")
         self.name_edit = QLineEdit(self._config.repository.name, repo_box)
-        self.name_edit.setPlaceholderText("例如 school-files（需为私有仓库）")
+        self.name_edit.setPlaceholderText(
+            f"留空默认 {DEFAULT_REPOSITORY_NAME}（需为私有仓库）")
         repo_form.addRow("用户名", self.owner_edit)
         repo_form.addRow("仓库名", self.name_edit)
         create_row = QHBoxLayout()
@@ -465,11 +513,53 @@ class OnboardingDialog(QDialog):
         self.repo_status.setStyleSheet(
             f"color: {COLORS['ok'] if ok else COLORS['error']};")
 
+    def _set_token_status(self, text: str, ok: bool = True) -> None:
+        self.token_status.setText(text)
+        self.token_status.setVisible(bool(text))
+        self.token_status.setStyleSheet(
+            f"color: {COLORS['ok'] if ok else COLORS['error']};")
+
+    def _open_token_page(self) -> None:
+        if not open_token_page():
+            self._set_token_status(f"没能打开浏览器，请手动访问：{TOKEN_CREATE_URL}", False)
+        else:
+            self._set_token_status("已在浏览器中打开 GitHub 的新建 Token 页面。")
+
+    def _auto_test_token(self) -> None:
+        """失焦/回车时顺手验一次，但只验看起来像 Token 的输入。"""
+        token = self.token_edit.text().strip()
+        if len(token) < 20 or token == self._probed_token:
+            return
+        self._test_token()
+
+    def _test_token(self) -> None:
+        token = self.token_edit.text().strip()
+        if not token:
+            self._set_token_status("请先粘贴 Token。", False)
+            return
+        self._probed_token = token
+        self._set_token_status("正在连接 GitHub……")
+        self.test_button.setEnabled(False)
+        self._probe = _ApiProbe(token, self._config.git.proxy, self)
+        self._probe.finished_probe.connect(self._on_probe_done)
+        self._probe.start()
+
+    def _on_probe_done(self, ok: bool, message: str, login: str = "") -> None:
+        self.test_button.setEnabled(True)
+        self._set_token_status(("✓ " if ok else "✗ ") + message, ok)
+        if not ok:
+            return
+        # 验证通过：顺手把用户名填上，用户只差一个仓库名。
+        if login and (not self.owner_edit.text().strip()
+                      or self.owner_edit.text().strip() == self._autofilled_owner):
+            self.owner_edit.setText(login)
+            self._autofilled_owner = login
+
     def _create_repository(self) -> None:
         token = self.token_edit.text().strip()
-        name = self.name_edit.text().strip()
-        if not token or not name:
-            self._set_status("请先填写 Token 和仓库名。", False)
+        name = self.name_edit.text().strip() or DEFAULT_REPOSITORY_NAME
+        if not token:
+            self._set_status("请先填写 Token。", False)
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
@@ -498,7 +588,8 @@ class OnboardingDialog(QDialog):
 
     def apply_to(self, config: Config) -> Config:
         config.repository.owner = self.owner_edit.text().strip()
-        config.repository.name = self.name_edit.text().strip()
+        config.repository.name = (
+            self.name_edit.text().strip() or DEFAULT_REPOSITORY_NAME)
         folder = self.watch_edit.text().strip()
         if folder:
             config.watch_folders = [folder]

@@ -70,6 +70,20 @@ if ($LASTEXITCODE -ne 0) { throw 'PyInstaller 打包失败。' }
 $exe = Join-Path $root 'dist\ArchiveMate\ArchiveMate.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw "没有找到产物：$exe" }
 
+# 许可与说明放在 exe 旁边而不是 _internal 里：PolyForm 要求分发时带上条款，
+# 而且用户第一眼就该看见「怎么用」「不能商用」。
+$distDir = Split-Path $exe
+foreach ($name in @('LICENSE', 'README.md')) {
+    $src = Join-Path $root $name
+    if (Test-Path -LiteralPath $src) {
+        Copy-Item -LiteralPath $src -Destination (Join-Path $distDir $name) -Force
+    }
+}
+$manual = Join-Path $root 'docs\使用说明.md'
+if (Test-Path -LiteralPath $manual) {
+    Copy-Item -LiteralPath $manual -Destination (Join-Path $distDir '使用说明.md') -Force
+}
+
 $sizeMb = [math]::Round(
     (Get-ChildItem -LiteralPath (Split-Path $exe) -Recurse -File |
         Measure-Object -Property Length -Sum).Sum / 1MB, 1)
