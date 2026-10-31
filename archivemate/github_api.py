@@ -111,6 +111,47 @@ class GitHubClient:
         return f"GitHub 返回 {exc.code}：{message or exc.reason}"
 
     # ------------------------------------------------------------------
+    # 流式下载
+    # ------------------------------------------------------------------
+
+    def open_download(self, repo_path: str, *, owner: str, name: str,
+                      ref: str = "", timeout: float | None = None):
+        """以原始字节流打开仓库里的一个文件。
+
+        走 ``/repos/{owner}/{repo}/contents/{path}`` + ``Accept:
+        application/vnd.github.raw``：这个接口支持私有仓库，而且响应体就是
+        文件本身，可以放心 ``read(65536)`` 边下边写，不会像 blob 接口那样
+        先把整个文件 base64 塞进内存。
+
+        返回 (response, 总字节数或 0)。调用方负责 close()。
+        """
+        quoted = urllib.parse.quote(repo_path.strip("/"), safe="/")
+        query = f"?ref={urllib.parse.quote(ref)}" if ref.strip() else ""
+        url = f"{API_ROOT}/repos/{owner}/{name}/contents/{quoted}{query}"
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/vnd.github.raw",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": USER_AGENT,
+        }
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        effective_timeout = self.timeout if timeout is None else timeout
+        try:
+            response = self._opener.open(request, timeout=effective_timeout)
+        except urllib.error.HTTPError as exc:
+            raise GitHubError(self._explain(exc), status=exc.code) from exc
+        except urllib.error.URLError as exc:
+            raise GitHubError(
+                f"无法连接 GitHub：{exc.reason}。请检查网络或代理设置。") from exc
+        except TimeoutError as exc:
+            raise GitHubError("连接 GitHub 超时，请检查网络或代理设置。") from exc
+        try:
+            total = int(response.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        return response, total
+
+    # ------------------------------------------------------------------
     # 具体接口
     # ------------------------------------------------------------------
 

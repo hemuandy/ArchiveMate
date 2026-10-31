@@ -8,8 +8,9 @@ from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-    QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QSpinBox,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .. import CREDENTIAL_TARGET, credentials
@@ -180,14 +181,33 @@ class SettingsDialog(QDialog):
         row.addWidget(self.archive_edit, 1)
         row.addWidget(browse)
         archive_layout.addLayout(row)
-        archive_hint = QLabel("文件推送成功后会被移动到这里的 年/月/类型/ 目录下，"
+        archive_hint = QLabel("文件推送成功后会被移动到这里的 学年/学期/类型/科目/ 目录下，"
                               "而不是直接删除。", archive_box)
         archive_hint.setObjectName("hint")
         archive_hint.setWordWrap(True)
         archive_layout.addWidget(archive_hint)
 
+        download_box = QGroupBox("下载文件夹", page)
+        download_layout = QVBoxLayout(download_box)
+        download_row = QHBoxLayout()
+        self.download_edit = QLineEdit(
+            self._config.resolved_download_folder().as_posix(), download_box)
+        self.download_edit.setPlaceholderText("留空则使用系统 Downloads 目录")
+        download_browse = QPushButton("选择…", download_box)
+        download_browse.clicked.connect(self._pick_download)
+        download_row.addWidget(self.download_edit, 1)
+        download_row.addWidget(download_browse)
+        download_layout.addLayout(download_row)
+        download_hint = QLabel("主界面「下载文件」把仓库里的文件存到这里；"
+                               "同名文件会自动改名，不会覆盖本地已有文件。",
+                               download_box)
+        download_hint.setObjectName("hint")
+        download_hint.setWordWrap(True)
+        download_layout.addWidget(download_hint)
+
         outer.addWidget(sync_box)
         outer.addWidget(archive_box)
+        outer.addWidget(download_box)
         outer.addStretch(1)
         return page
 
@@ -282,6 +302,12 @@ class SettingsDialog(QDialog):
         if chosen:
             self.archive_edit.setText(chosen)
 
+    def _pick_download(self) -> None:
+        start = self.download_edit.text().strip() or ""
+        chosen = QFileDialog.getExistingDirectory(self, "选择下载文件夹", start)
+        if chosen:
+            self.download_edit.setText(chosen)
+
     def _pick_git(self) -> None:
         filters = "git 可执行文件 (git.exe git);;所有文件 (*)"
         chosen, _ = QFileDialog.getOpenFileName(self, "选择 git", "", filters)
@@ -359,6 +385,7 @@ class SettingsDialog(QDialog):
         repo.remote_url = self.remote_edit.text().strip()
 
         config.archive_folder = self.archive_edit.text().strip()
+        config.download_folder = self.download_edit.text().strip()
         config.sync_schedule = str(self.interval_combo.currentData() or "off")
         config.date_source = str(self.date_combo.currentData())
         config.git.proxy = self.proxy_edit.text().strip()
@@ -661,3 +688,248 @@ def ask(parent, title: str, text: str) -> bool:
 
 def describe_bytes(count: int) -> str:
     return human_size(count)
+
+
+class _ListThread(QThread):
+    """后台列仓库文件，别让「正在连接」把界面冻住。"""
+
+    finished_list = Signal(bool, object, str)
+
+    def __init__(self, downloader, parent=None) -> None:
+        super().__init__(parent)
+        self._downloader = downloader
+
+    def run(self) -> None:  # noqa: D102
+        try:
+            files = self._downloader.list_files()
+            self.finished_list.emit(True, files, "")
+        except Exception as exc:
+            self.finished_list.emit(False, [], str(exc))
+
+
+class _DownloadThread(QThread):
+    """后台流式下载选中的文件。"""
+
+    progress = Signal(str, int, int)
+    finished_all = Signal(bool, object, str)
+
+    def __init__(self, downloader, files, dest_dir, parent=None) -> None:
+        super().__init__(parent)
+        self._downloader = downloader
+        self._files = list(files)
+        self._dest = dest_dir
+
+    def cancel(self) -> None:
+        self._downloader.cancel()
+
+    def run(self) -> None:  # noqa: D102
+        from ..errors import DownloadCancelled
+
+        try:
+            saved = self._downloader.download_many(self._files, self._dest)
+            self.finished_all.emit(True, saved, "")
+        except DownloadCancelled as exc:
+            self.finished_all.emit(False, [], str(exc))
+        except Exception as exc:
+            self.finished_all.emit(False, [], str(exc))
+
+
+class DownloadDialog(QDialog):
+    """从 GitHub 下载归档文件：勾选 → 下载，带进度条与取消。"""
+
+    def __init__(self, service, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("从 GitHub 下载")
+        self.setMinimumSize(620, 460)
+
+        self._service = service
+        self._files: list = []
+        self._list_thread: _ListThread | None = None
+        self._worker: _DownloadThread | None = None
+
+        self.target_label = QLabel(self)
+        self.target_label.setObjectName("hint")
+        self.target_label.setWordWrap(True)
+
+        self.list_widget = QListWidget(self)
+        self.list_widget.setAlternatingRowColors(True)
+        self.list_widget.itemChanged.connect(lambda _i: self._refresh_buttons())
+
+        self.hint = QLabel("正在读取仓库里的文件……", self)
+        self.hint.setObjectName("hint")
+        self.hint.setWordWrap(True)
+
+        self.progress = QProgressBar(self)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        self.progress.setVisible(False)
+
+        self.select_all_button = QPushButton("全选", self)
+        self.select_all_button.clicked.connect(lambda: self._set_all(True))
+        self.select_none_button = QPushButton("全不选", self)
+        self.select_none_button.clicked.connect(lambda: self._set_all(False))
+        self.download_button = QPushButton("下载选中", self)
+        self.download_button.setDefault(True)
+        self.download_button.clicked.connect(self._download_checked)
+        self.latest_button = QPushButton("一键下载最新", self)
+        self.latest_button.setToolTip("把仓库里的全部文件都下载下来")
+        self.latest_button.clicked.connect(self._download_all)
+        self.cancel_button = QPushButton("取消下载", self)
+        self.cancel_button.setVisible(False)
+        self.cancel_button.clicked.connect(self._cancel)
+        self.close_button = QPushButton("关闭", self)
+        self.close_button.clicked.connect(self.reject)
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.select_all_button)
+        buttons.addWidget(self.select_none_button)
+        buttons.addStretch(1)
+        buttons.addWidget(self.download_button)
+        buttons.addWidget(self.latest_button)
+        buttons.addWidget(self.cancel_button)
+        buttons.addWidget(self.close_button)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.target_label)
+        layout.addWidget(self.list_widget, 1)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.hint)
+        layout.addLayout(buttons)
+
+        self._refresh_target()
+        self._refresh_buttons()
+        self._start_listing()
+
+    # ------------------------------------------------------------------
+
+    def _refresh_target(self) -> None:
+        folder = self._service.download_folder()
+        self.target_label.setText(f"下载到：{folder}")
+
+    def _refresh_buttons(self) -> None:
+        busy = self._worker is not None and self._worker.isRunning()
+        ready = bool(self._files) and not busy
+        self.select_all_button.setEnabled(ready)
+        self.select_none_button.setEnabled(ready)
+        self.latest_button.setEnabled(ready)
+        self.download_button.setEnabled(ready and bool(self._checked()))
+
+    def _set_all(self, checked: bool) -> None:
+        for index in range(self.list_widget.count()):
+            self.list_widget.item(index).setCheckState(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        self._refresh_buttons()
+
+    def _checked(self) -> list:
+        out = []
+        for index, item in enumerate(self._files):
+            widget = self.list_widget.item(index)
+            if widget is not None and widget.checkState() == Qt.CheckState.Checked:
+                out.append(item)
+        return out
+
+    # ------------------------------------------------------------------
+    # 列目录
+    # ------------------------------------------------------------------
+
+    def _start_listing(self) -> None:
+        downloader = self._service.build_downloader()
+        self._list_thread = _ListThread(downloader, self)
+        self._list_thread.finished_list.connect(self._on_listed)
+        self._list_thread.start()
+
+    def _on_listed(self, ok: bool, files, message: str) -> None:
+        self.list_widget.clear()
+        if not ok:
+            self.hint.setText(f"✗ {message}")
+            self.hint.setStyleSheet(f"color: {COLORS['error']};")
+            self._files = []
+            self._refresh_buttons()
+            return
+        self._files = list(files)
+        for item in self._files:
+            entry = QListWidgetItem(f"{item.path}    {item.describe_size()}")
+            entry.setFlags(entry.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            entry.setCheckState(Qt.CheckState.Unchecked)
+            entry.setToolTip(item.path)
+            self.list_widget.addItem(entry)
+        self.hint.setStyleSheet("")
+        if not self._files:
+            self.hint.setText("仓库里还没有文件。")
+        else:
+            self.hint.setText(
+                f"共 {len(self._files)} 个文件。勾选后点「下载选中」，"
+                f"或直接点「一键下载最新」全部收下来。")
+        self._refresh_buttons()
+
+    # ------------------------------------------------------------------
+    # 下载
+    # ------------------------------------------------------------------
+
+    def _download_checked(self) -> None:
+        self._start(self._checked())
+
+    def _download_all(self) -> None:
+        self._start(list(self._files))
+
+    def _start(self, files) -> None:
+        if not files:
+            self.hint.setText("请先勾选要下载的文件。")
+            return
+        dest = self._service.download_folder()
+        downloader = self._service.build_downloader()
+        self.progress.setVisible(True)
+        self.progress.setValue(0)
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setVisible(True)
+        self.hint.setStyleSheet("")
+        self.hint.setText(f"准备下载 {len(files)} 个文件……")
+
+        self._worker = _DownloadThread(downloader, files, dest, self)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished_all.connect(self._on_finished)
+        self._worker.start()
+        self._refresh_buttons()
+
+    def _on_progress(self, path: str, done: int, total: int) -> None:
+        name = path.rsplit("/", 1)[-1]
+        if done and not total:
+            self.hint.setText(f"正在下载：{name}（{human_size(done)}）")
+            return
+        percent = int(done * 100 / total) if total else 0
+        self.progress.setValue(max(0, min(100, percent)))
+        self.hint.setText(
+            f"正在下载：{name} — {human_size(done)} / {human_size(total)}")
+
+    def _on_finished(self, ok: bool, saved, message: str) -> None:
+        self.cancel_button.setVisible(False)
+        self.progress.setVisible(False)
+        self._worker = None
+        if ok:
+            self.hint.setStyleSheet(f"color: {COLORS['ok']};")
+            self.hint.setText(
+                f"✓ 已下载 {len(saved)} 个文件到 {self._service.download_folder()}")
+        elif "取消" in message:
+            self.hint.setStyleSheet(f"color: {COLORS['warn']};")
+            self.hint.setText("已取消下载，未完成的临时文件已清理。")
+        else:
+            self.hint.setStyleSheet(f"color: {COLORS['error']};")
+            self.hint.setText(f"✗ {message}")
+        self._refresh_buttons()
+
+    def _cancel(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
+            self.cancel_button.setEnabled(False)
+            self.hint.setText("正在取消……")
+
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event) -> None:  # noqa: D102
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait(3000)
+        if self._list_thread is not None and self._list_thread.isRunning():
+            self._list_thread.wait(3000)
+        super().closeEvent(event)

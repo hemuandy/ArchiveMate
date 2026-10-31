@@ -121,6 +121,15 @@ def default_archive_dir() -> Path:
     return Path.home() / "ArchiveMate归档"
 
 
+def default_download_dir() -> Path:
+    """「从 GitHub 下载」的默认落点：系统的 Downloads 目录。
+
+    不判断目录是否存在——第一次下载时再 mkdir，省得用户清掉 Downloads
+    之后默认值就飘到别处去了。
+    """
+    return Path.home() / "Downloads"
+
+
 def default_watch_folders() -> list[Path]:
     """默认预填系统「下载」目录。"""
     folders: list[Path] = []

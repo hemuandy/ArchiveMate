@@ -325,6 +325,55 @@ def cmd_clear_archive(args, service) -> int:
     return EXIT_OK
 
 
+def cmd_download(args, service) -> int:
+    from .errors import DownloadError
+
+    try:
+        files = service.list_remote_files()
+    except (DownloadError, credentials.CredentialError) as exc:
+        _echo(f"✗ {exc}")
+        return EXIT_FAIL
+    if not files:
+        _echo("仓库里还没有任何文件。")
+        return EXIT_OK
+    if args.list:
+        _echo(f"远端共有 {len(files)} 个文件：")
+        for item in files:
+            _echo(f"  {item.describe_size():>10}  {item.path}")
+        if not args.paths:
+            return EXIT_OK
+
+    wanted = None if (args.all or not args.paths) else list(args.paths)
+    if wanted is not None:
+        known = {item.path for item in files}
+        missing = [path for path in wanted if path not in known]
+        if missing:
+            _echo("✗ 远端没有这些文件：")
+            for path in missing:
+                _echo(f"    {path}")
+            return EXIT_USAGE
+
+    dest = Path(args.dest).expanduser() if args.dest else service.download_folder()
+    _echo(f"下载到：{dest}")
+    last = {"pct": -1}
+
+    def progress(name, done, total):
+        pct = int(done * 100 / total) if total else 0
+        if pct != last["pct"]:
+            last["pct"] = pct
+            _echo(f"  {name}  {human_size(done)} / {human_size(total)}  {pct}%")
+
+    try:
+        saved = service.download_files(wanted, dest_dir=dest, on_progress=progress)
+    except DownloadError as exc:
+        _echo(f"✗ {exc}")
+        return EXIT_FAIL
+    _echo(f"✓ 已下载 {len(saved)} 个文件。")
+    for path in saved:
+        _echo(f"    {path}")
+    return EXIT_OK
+
+
 def cmd_config(args, service) -> int:
     cfg = service.config
     if args.set:
@@ -542,6 +591,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("clear-archive", help="清空归档文件夹")
     p.add_argument("-y", "--yes", action="store_true")
     p.set_defaults(func=cmd_clear_archive)
+
+    p = sub.add_parser("download", help="从 GitHub 下载文件（默认全部）")
+    p.add_argument("paths", nargs="*", metavar="远端路径",
+                   help="只下载这些路径，例如 2026-2027学年/上学期/课件/数学/数学课件.pptx")
+    p.add_argument("-a", "--all", action="store_true", help="下载全部文件")
+    p.add_argument("-l", "--list", action="store_true", help="只列出，不下载")
+    p.add_argument("-d", "--dest", help="下载到哪个目录（默认用设置里的下载文件夹）")
+    p.set_defaults(func=cmd_download)
 
     p = sub.add_parser("config", help="查看或修改配置")
     p.add_argument("--set", action="append", nargs="+", metavar="KEY=VALUE",

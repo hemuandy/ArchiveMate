@@ -144,6 +144,8 @@ class Config:
     watch_folders: list[str] = field(default_factory=list)
     file_types: list[str] = field(default_factory=lambda: list(DEFAULT_FILE_TYPES))
     archive_folder: str = ""
+    #: 「从 GitHub 下载」的落点，留空就用系统 Downloads 目录。
+    download_folder: str = ""
     sync_schedule: str = "off"          # off | daily | weekly | monthly
     date_source: str = "mtime"          # mtime | now
     stability_seconds: float = 3.0
@@ -182,6 +184,8 @@ class Config:
         cfg.watch_folders = _as_str_list(data.get("watch_folders"), cfg.watch_folders)
         cfg.file_types = _as_str_list(data.get("file_types"), cfg.file_types)
         cfg.archive_folder = _as_str(data.get("archive_folder"), cfg.archive_folder)
+        cfg.download_folder = _as_str(
+            data.get("download_folder"), cfg.download_folder)
         cfg.sync_schedule = _as_schedule(data)
         cfg.date_source = _as_str(data.get("date_source"), cfg.date_source)
         cfg.stability_seconds = _as_float(
@@ -243,6 +247,7 @@ class Config:
         if not self.file_types:
             self.file_types = list(DEFAULT_FILE_TYPES)
         self.archive_folder = _expand(self.archive_folder) if self.archive_folder else ""
+        self.download_folder = _expand(self.download_folder) if self.download_folder else ""
         if self.date_source not in ("mtime", "now"):
             self.date_source = "mtime"
         if self.sync_schedule not in SCHEDULE_KEYS:
@@ -265,6 +270,13 @@ class Config:
         from .schedule import schedule_label
 
         return schedule_label(self.sync_schedule)
+
+    def resolved_download_folder(self) -> Path:
+        """下载落点；没配置就用系统 Downloads 目录。"""
+        raw = self.download_folder.strip()
+        if raw:
+            return Path(raw)
+        return app_paths.default_download_dir()
 
     def matches_type(self, filename: str) -> bool:
         suffix = Path(filename).suffix.lower()

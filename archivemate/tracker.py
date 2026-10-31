@@ -15,9 +15,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import app_paths
+from . import app_paths, classify
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 MAX_HISTORY = 300
 MAX_SEEN = 20000
 
@@ -148,6 +148,26 @@ class Tracker:
                 "pushed_files": float(stats.get("pushed_files") or 0),
                 "pushed_bytes": float(stats.get("pushed_bytes") or 0),
             }
+        self._migrate_legacy_paths()
+
+    def _migrate_legacy_paths(self) -> None:
+        """把 v1（日期/类型两段）的队列路径重新算成 v2 的四段路径。
+
+        老版本留下的待推送项带着 ``2026/10/ppt/x.pptx`` 这种路径，直接推上去
+        会在仓库里留下两套目录结构。源文件还在就按新规则重算；不在就原样留着，
+        反正同步时会被标成「源文件丢失」。
+        """
+        for item in self.items:
+            parts = item.dest_rel.replace("\\", "/").split("/")
+            if len(parts) >= 5:
+                continue
+            source = item.source_path
+            try:
+                if not source.is_file():
+                    continue
+                item.dest_rel = classify.build_dest_rel(source)
+            except OSError:
+                continue
 
     def save(self) -> None:
         if len(self.seen) > MAX_SEEN:

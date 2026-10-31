@@ -23,6 +23,7 @@ python -m pip install PySide6            # 运行时依赖只有这一个（Pyth
 
 python -m archivemate                    # 图形界面
 python -m archivemate --cli doctor       # 命令行排障
+python -m archivemate --cli download -l  # 列出远端文件；去掉 -l 就下载全部
 
 $env:QT_QPA_PLATFORM = 'offscreen'       # 无头跑 GUI 测试
 python -m unittest discover -s tests
@@ -37,7 +38,8 @@ pwsh -NoProfile -File build.ps1          # 打包免安装成品
 | 多个监控文件夹（可增删，默认预填「下载」） | `watcher.py` / `service.py` |
 | 拖拽上传，与自动监控走同一条处理流程 | `gui/widgets.py: DropArea` |
 | 目标文件类型列表（可增删） | `config.py` / `gui/widgets.py: ListEditor` |
-| 按日期 + 类型分类，如 `2026/10/ppt/数学课件.pptx` | `classify.py` |
+| 按「学年 / 学期 / 类型 / 科目」分类，如 `2026-2027学年/上学期/课件/数学/数学课件.pptx` | `classify.py` |
+| 从 GitHub 下载：勾选文件或一键全部，流式写盘、可取消 | `downloader.py` / `gui/dialogs.py: DownloadDialog` |
 | 手动同步 + 定时同步（关闭 / 每天 0 点 / 每周一 0 点 / 每月 1 号 0 点） | `schedule.py` / `gui/main_window.py` |
 | 推送成功后归档（移动而非删除），「清空归档」需二次确认 | `sync.py: _archive_item` |
 | 默认走 GitHub REST 接口建提交，不下载仓库已有文件 | `api_backend.py` |
@@ -57,9 +59,10 @@ archivemate/
 ├─ config.py         配置数据类、读写、清洗
 ├─ schedule.py       定时同步的「下一次 0 点」计算
 ├─ credentials.py    跨平台密钥链（Windows 走 ctypes 调 advapi32）
-├─ classify.py       日期 + 类型 → 仓库内相对路径
+├─ classify.py       学年 / 学期 / 类型 / 科目 → 仓库内相对路径
 ├─ fsutil.py         体积阈值、稳定性判定、安全移动
 ├─ api_backend.py    默认推送后端：GitHub REST，不下载仓库已有文件
+├─ downloader.py     默认下载通路：REST + 流式写盘，可取消
 ├─ git_backend.py    bare 仓库 + 底层管道（hash-object/mktree/commit-tree/push）
 ├─ github_api.py     纯 urllib 的 GitHub REST 客户端（含代理）
 ├─ service.py        业务门面：监控 + 队列 + 同步 + 事件流（GUI / CLI 共用）
@@ -81,8 +84,16 @@ archivemate.spec     PyInstaller 配置；build.ps1 一键打包
   实测 `git fetch` 一个 49 MB 的仓库在目标网络里 15 分钟都下不完，而 REST 只传**这次新增的文件**，
   读远端状态 2.6 秒。`git` 后端保留给超 45 MiB 的大文件和已配好凭据助手的机器，两者接口一致。
   （顺带记个坑：`git fetch --filter=blob:none` + `git push` 走不通，推送前的连通性检查要求本地对象齐全。）
+- **分类按学校的时间口径走**：9 月开学，9 月～次年 1 月算同一学年的上学期，
+  2 月～8 月算下学期（`2026-2027学年/上学期/课件/数学/…`）。科目靠内置词库认文件名，
+  词长优先所以「生物」不会被认成「物理」；单字别名（语数英…）只在独立成词时才算数，
+  否则「学生手册」会被认成生物。认不出的统一进 `其他`。
 - **同名文件覆盖**：仓库里同路径就是替换，保持「仓库里永远是最新那份」。
   例外是同一批里两个待推送文件撞名——那必须错开，否则会静默丢一个。
+  下载方向相反：本地已有同名文件时自动存成 `xxx (2).pdf`，绝不覆盖本地文件。
+- **下载也不走 `git clone`**：列目录用三个小请求拿到全部路径与体积，取内容用
+  `contents` 接口的 raw 响应、64 KiB 一块边收边写，内存占用与文件大小无关；
+  连续 120 秒没有新数据就中止，中途取消会删掉半成品的 `.part`。
 - **Token 绝不出现在命令行**：用 `GIT_CONFIG_VALUE_0=http.extraheader` 注入
   `Authorization: Basic base64(...)`，再配 `GIT_TERMINAL_PROMPT=0` / `GCM_INTERACTIVE=Never`。
 - **git 子进程一律不用管道**：`subprocess` 的 timeout 在孙进程握着写端时会永久阻塞，
@@ -94,11 +105,14 @@ archivemate.spec     PyInstaller 配置；build.ps1 一键打包
 
 ```powershell
 $env:QT_QPA_PLATFORM = 'offscreen'
-python -m unittest discover -s tests      # Ran 170 tests ... OK
+python -m unittest discover -s tests      # Ran 230 tests ... OK
 ```
 
-覆盖重点：分类与体积规则、配置读写与钳位、端到端流水线（`LocalOnlyBackend` 把「远端」指向本地
-bare 仓库，blob/tree/commit/归档全部真实执行）、在线后端（假 HTTP 层）、
+覆盖重点：分类（跨年学年、学期边界、科目别名冲突、Windows 非法字符）、体积规则、
+配置读写与钳位、端到端流水线（`LocalOnlyBackend` 把「远端」指向本地 bare 仓库，
+blob/tree/commit/归档全部真实执行）、在线后端（假 HTTP 层）、
+下载（流式写盘、进度回调、中途取消与 `.part` 清理、停滞检测、下载目录配置、
+命令行 `download` 子命令的退出码）、
 定时时刻计算（跨月、跨年、周一 0 点边界）、
 凭据卫生（Token 不进命令行/配置/日志，源码无硬编码）、密钥链降级、
 传输层报错文案、子进程不挂死、离屏界面全流程，以及**界面调用 GitHub 客户端时的参数签名**

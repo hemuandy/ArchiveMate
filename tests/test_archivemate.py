@@ -136,26 +136,106 @@ def _touch(path: Path, payload: bytes, when: str) -> Path:
 class TestClassify(unittest.TestCase):
     def test_type_dirs(self):
         cases = {
-            "a.pdf": "pdf", "a.PPTX": "ppt", "a.doc": "doc", "a.docx": "doc",
-            "a.xlsx": "excel", "a.zip": "archive", "a.png": "image",
-            "a.mp4": "video", "a.mp3": "audio", "a.md": "txt",
-            "a.zzz": "zzz", "noext": "other",
+            "a.pptx": "课件", "a.PPT": "课件", "a.ppt": "课件",
+            "a.pdf": "其他", "a.doc": "其他", "a.docx": "其他",
+            "a.xlsx": "其他", "a.zip": "其他", "a.png": "其他",
+            "a.mp4": "其他", "a.md": "其他", "a.zzz": "其他",
+            "noext": "其他", "a.pps": "其他", "a.odp": "其他",
         }
         for name, expected in cases.items():
             with self.subTest(name=name):
                 self.assertEqual(classify.type_dir_for(name), expected)
+
+    def test_type_dir_accepts_extension_or_filename(self):
+        self.assertEqual(classify.type_dir_for(".pptx"), "课件")
+        self.assertEqual(classify.type_dir_for("数学课件.PPTX"), "课件")
+        self.assertEqual(classify.type_dir_for(""), "其他")
+
+    def test_school_year_across_new_year(self):
+        # 9 月开学，到次年 8 月都算同一个学年
+        cases = {
+            (2026, 9): "2026-2027", (2026, 10): "2026-2027",
+            (2026, 12): "2026-2027", (2027, 1): "2026-2027",
+            (2027, 2): "2026-2027", (2027, 8): "2026-2027",
+            (2027, 9): "2027-2028", (2026, 8): "2025-2026",
+            (2026, 1): "2025-2026",
+        }
+        for (year, month), expected in cases.items():
+            with self.subTest(when=f"{year}-{month:02d}"):
+                self.assertEqual(
+                    classify.school_year_for(datetime(year, month, 15)), expected)
+
+    def test_term_for(self):
+        for month in (9, 10, 11, 12, 1):
+            with self.subTest(month=month):
+                self.assertEqual(
+                    classify.term_for(datetime(2026, month, 1)), "上学期")
+        for month in (2, 3, 4, 5, 6, 7, 8):
+            with self.subTest(month=month):
+                self.assertEqual(
+                    classify.term_for(datetime(2026, month, 1)), "下学期")
+
+    def test_subject_keywords(self):
+        cases = {
+            "数学课件": "数学", "语文阅读": "语文", "英语听力": "英语",
+            "物理力学": "物理", "化学元素周期": "化学", "生物细胞": "生物",
+            "地理气候": "地理", "政治时政": "政治", "历史辛亥革命": "历史",
+            "English Unit 3": "英语", "高三作文范文": "语文",
+        }
+        for stem, expected in cases.items():
+            with self.subTest(stem=stem):
+                self.assertEqual(classify.subject_for(stem), expected)
+
+    def test_biology_beats_physics_on_word_length(self):
+        # 「生物」含「物」，但多字词优先，不能被认成物理
+        self.assertEqual(classify.subject_for("生物"), "生物")
+        self.assertEqual(classify.subject_for("生物学讲义"), "生物")
+        self.assertEqual(classify.subject_for("物理"), "物理")
+
+    def test_single_char_alias_needs_word_boundary(self):
+        self.assertEqual(classify.subject_for("数1"), "数学")
+        self.assertEqual(classify.subject_for("生-笔记"), "生物")
+        self.assertEqual(classify.subject_for("英 语法"), "英语")
+        # 被汉字包围的单字不算数：「学生手册」不是生物
+        self.assertEqual(classify.subject_for("学生手册"), "其他")
+
+    def test_title_words_do_not_decide_subject(self):
+        self.assertEqual(classify.subject_for("数学期末试卷"), "数学")
+        self.assertEqual(classify.subject_for("历史复习提纲"), "历史")
+        self.assertEqual(classify.subject_for("期末试卷"), "其他")
+
+    def test_unknown_subject_falls_back(self):
+        for stem in ("", "   ", "abc123", "值日表"):
+            with self.subTest(stem=stem):
+                self.assertEqual(classify.subject_for(stem), "其他")
 
     def test_build_dest_rel_uses_mtime(self):
         tmp = _mkdtemp("cls-")
         self.addCleanup(shutil.rmtree, tmp, True)
         source = _touch(tmp / "数学课件.pptx", b"x", "2026-10-11 09:30")
         dest = classify.build_dest_rel(source)
-        self.assertEqual(dest, "2026/10/ppt/数学课件.pptx")
+        self.assertEqual(dest, "2026-2027学年/上学期/课件/数学/数学课件.pptx")
 
     def test_build_dest_rel_now_override(self):
         when = datetime(2026, 1, 2, 9, 30)
         dest = classify.build_dest_rel(Path("c.pdf"), date_source="now", now=when)
-        self.assertEqual(dest, "2026/01/pdf/c.pdf")
+        # 1 月还在上一个学年的上学期
+        self.assertEqual(dest, "2025-2026学年/上学期/其他/其他/c.pdf")
+
+    def test_build_dest_rel_second_term(self):
+        when = datetime(2027, 5, 6, 8, 0)
+        dest = classify.build_dest_rel(Path("历史复习提纲.pdf"),
+                                       date_source="now", now=when)
+        self.assertEqual(dest, "2026-2027学年/下学期/其他/历史/历史复习提纲.pdf")
+
+    def test_dest_parts_roundtrip(self):
+        rel = "2026-2027学年/上学期/课件/数学/数学课件.pptx"
+        self.assertEqual(
+            classify.dest_parts(rel),
+            ("2026-2027学年", "上学期", "课件", "数学", "数学课件.pptx"))
+        # 老格式的三段路径也要能拆，缺的补空串
+        self.assertEqual(classify.dest_parts("2026/10/a.pptx"),
+                         ("2026", "10", "a.pptx", "", ""))
 
     def test_sanitize_windows_reserved(self):
         cleaned = classify.sanitize_filename('CON<>:"/\\|?*.pdf')
@@ -165,8 +245,17 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(classify.sanitize_filename("CON.pdf"), "_CON.pdf")
         self.assertEqual(classify.sanitize_filename(""), "未命名文件")
 
+    def test_sanitize_keeps_normal_name(self):
+        # v2 起文件名不再加日期前缀
+        self.assertEqual(classify.sanitize_filename("数学课件.pptx"), "数学课件.pptx")
+        self.assertEqual(classify.sanitize_filename("第一单元 练习2.docx"),
+                         "第一单元 练习2.docx")
+
     def test_human_category(self):
-        self.assertIn("/", classify.human_category("2026/10/ppt/a.pptx"))
+        self.assertEqual(
+            classify.human_category("2026-2027学年/上学期/课件/数学/a.pptx"),
+            "2026-2027学年 上学期 / 课件 / 数学")
+        self.assertEqual(classify.human_category(""), "未分类")
 
 
 # ======================================================================
@@ -331,6 +420,39 @@ class TestTracker(unittest.TestCase):
         self.target.unlink()
         self.assertEqual(tracker.prune_seen(), 1)
         self.assertEqual(tracker.seen, {})
+
+    def test_legacy_dest_rel_is_recomputed_on_load(self):
+        # v1 留下的队列项带着「日期/类型」老路径，升级后要按新规则重算
+        path = self.tmp / "state.json"
+        tracker = Tracker(path)
+        tracker.add(self.target, dest_rel="2026/10/pdf/a.pdf")
+        tracker.save()
+
+        again = Tracker(path)
+        self.assertEqual(len(again.items), 1)
+        self.assertEqual(
+            again.items[0].dest_rel,
+            classify.build_dest_rel(self.target))
+        self.assertEqual(len(again.items[0].dest_rel.split("/")), 5)
+
+    def test_legacy_dest_rel_kept_when_source_gone(self):
+        path = self.tmp / "state.json"
+        tracker = Tracker(path)
+        tracker.add(self.target, dest_rel="2026/10/pdf/a.pdf")
+        tracker.save()
+        self.target.unlink()
+
+        again = Tracker(path)
+        self.assertEqual(again.items[0].dest_rel, "2026/10/pdf/a.pdf",
+                         "源文件没了就别瞎猜，交给同步阶段标成「源文件丢失」")
+
+    def test_new_style_dest_rel_is_left_alone(self):
+        path = self.tmp / "state.json"
+        tracker = Tracker(path)
+        good = "2026-2027学年/上学期/课件/数学/a.pptx"
+        tracker.add(self.target, dest_rel=good)
+        tracker.save()
+        self.assertEqual(Tracker(path).items[0].dest_rel, good)
 
 
 # ======================================================================
@@ -573,8 +695,8 @@ class TestEndToEnd(unittest.TestCase):
 
         # --- 远端仓库内容 ---
         tree = self._remote_paths()
-        self.assertIn("2026/10/ppt/数学课件.pptx", tree)
-        self.assertIn("2026/10/doc/作文模板.docx", tree)
+        self.assertIn("2026-2027学年/上学期/课件/数学/数学课件.pptx", tree)
+        self.assertIn("2026-2027学年/上学期/其他/语文/作文模板.docx", tree)
         self.assertNotIn("笔记.txt", "".join(tree))
 
         log = self._git("log", "--format=%s", "main").strip()
@@ -584,8 +706,10 @@ class TestEndToEnd(unittest.TestCase):
                          f"add: {datetime.now().strftime('%Y-%m-%d')} 2 个文件")
 
         # --- 归档 ---
-        self.assertTrue((self.archive / "2026/10/ppt/数学课件.pptx").is_file())
-        self.assertTrue((self.archive / "2026/10/doc/作文模板.docx").is_file())
+        ppt_rel = "2026-2027学年/上学期/课件/数学/数学课件.pptx"
+        doc_rel = "2026-2027学年/上学期/其他/语文/作文模板.docx"
+        self.assertTrue((self.archive / ppt_rel).is_file())
+        self.assertTrue((self.archive / doc_rel).is_file())
         self.assertFalse((self.downloads / "数学课件.pptx").exists(),
                          "推送成功后源文件应已移走")
         self.assertTrue(ignored.is_file(), "非目标类型文件不能被动")
@@ -593,7 +717,7 @@ class TestEndToEnd(unittest.TestCase):
 
         # --- 队列与历史 ---
         remaining = {item.dest_rel for item in self.service.tracker.items}
-        self.assertEqual(remaining, {"2026/10/pdf/大文件.pdf"})
+        self.assertEqual(remaining, {"2026-2027学年/上学期/其他/其他/大文件.pdf"})
         self.assertEqual(len(self.service.tracker.history), 2)
         self.assertEqual(self.service.tracker.stats["pushed_files"], 2)
 
@@ -618,7 +742,8 @@ class TestEndToEnd(unittest.TestCase):
         first = self._write("同名.pdf", b"first version")
         self.service.ingest(first)
         self.service.sync_blocking()
-        self.assertIn("2026/10/pdf/同名.pdf", self._remote_paths())
+        rel = "2026-2027学年/上学期/其他/其他/同名.pdf"
+        self.assertIn(rel, self._remote_paths())
 
         # 再放一个同名但内容不同的文件（模拟重新下载）：同名就要覆盖，不要留 (2)
         self._write("同名.pdf", b"second version, different")
@@ -627,9 +752,9 @@ class TestEndToEnd(unittest.TestCase):
         self.assertTrue(outcome.ok, outcome.message)
 
         tree = self._remote_paths()
-        self.assertIn("2026/10/pdf/同名.pdf", tree)
-        self.assertNotIn("2026/10/pdf/同名 (2).pdf", tree)
-        self.assertIn(b"second version, different", self._remote_bytes("2026/10/pdf/同名.pdf"))
+        self.assertIn(rel, tree)
+        self.assertNotIn("2026-2027学年/上学期/其他/其他/同名 (2).pdf", tree)
+        self.assertIn(b"second version, different", self._remote_bytes(rel))
 
     def test_same_name_in_one_batch_still_gets_distinct_paths(self):
         # 同一批里两个不同文件撞名：不能互相覆盖，否则会静默丢一个
@@ -644,8 +769,9 @@ class TestEndToEnd(unittest.TestCase):
         outcome = self.service.sync_blocking()
         self.assertTrue(outcome.ok, outcome.message)
         tree = self._remote_paths()
-        self.assertIn("2026/10/pdf/撞名.pdf", tree)
-        self.assertIn("2026/10/pdf/撞名 (2).pdf", tree)
+        folder = "2026-2027学年/上学期/其他/其他"
+        self.assertIn(f"{folder}/撞名.pdf", tree)
+        self.assertIn(f"{folder}/撞名 (2).pdf", tree)
 
     def test_retry_after_source_deleted(self):
         path = self._write("会消失.pdf", b"bye")
@@ -1758,6 +1884,114 @@ class TestSyncCancellation(unittest.TestCase):
         # 文件没有被归档，也没有被算作失败
         self.assertTrue(self.downloads.joinpath("讲义.pdf").exists())
         self.assertEqual(outcome.failed, [])
+
+
+class _FakeDownloadService:
+    """只实现 cmd_download 用到的那几个方法，不碰网络。"""
+
+    def __init__(self, files, dest, error=None):
+        self.files = files
+        self.dest = dest
+        self.error = error
+        self.calls = []
+
+    def list_remote_files(self):
+        if self.error is not None:
+            raise self.error
+        return list(self.files)
+
+    def download_folder(self):
+        return self.dest
+
+    def download_files(self, paths=None, *, dest_dir=None, on_progress=None):
+        self.calls.append((paths, dest_dir))
+        wanted = [f for f in self.files if paths is None or f.path in set(paths)]
+        saved = []
+        for item in wanted:
+            if on_progress is not None:
+                on_progress(item.path, item.size, item.size)
+            target = Path(dest_dir) / Path(item.path).name
+            saved.append(target)
+        return saved
+
+
+class TestCliDownload(unittest.TestCase):
+    """命令行的 download 子命令：列清单、挑文件、报错、退出码。"""
+
+    def setUp(self):
+        from archivemate.downloader import RemoteFile
+
+        self.base = _mkdtemp("cli-dl-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.dest = self.base / "downloads"
+        self.dest.mkdir(parents=True, exist_ok=True)
+        self.files = [
+            RemoteFile("2026-2027学年/上学期/课件/数学/数学课件.pptx", 2048),
+            RemoteFile("2026-2027学年/上学期/其他/语文/作文模板.docx", 512),
+        ]
+        self.echoed: list[str] = []
+
+    def _run(self, service, **kwargs):
+        import argparse
+
+        from archivemate import cli
+
+        args = argparse.Namespace(paths=[], all=False, list=False, dest=None)
+        for key, value in kwargs.items():
+            setattr(args, key, value)
+        with mock.patch.object(cli, "_echo", side_effect=self.echoed.append):
+            code = cli.cmd_download(args, service)
+        return code, "\n".join(self.echoed)
+
+    def _service(self, **kwargs):
+        return _FakeDownloadService(self.files, self.dest, **kwargs)
+
+    def test_list_shows_paths_and_sizes_without_downloading(self):
+        service = self._service()
+        code, text = self._run(service, list=True)
+        self.assertEqual(code, 0)
+        self.assertIn("数学课件.pptx", text)
+        self.assertIn("2.0 KB", text)
+        self.assertIn("作文模板.docx", text)
+        self.assertEqual(service.calls, [])
+
+    def test_all_downloads_everything(self):
+        service = self._service()
+        code, text = self._run(service, all=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(service.calls), 1)
+        self.assertIsNone(service.calls[0][0])
+        self.assertEqual(service.calls[0][1], self.dest)
+        self.assertIn("已下载 2 个文件", text)
+
+    def test_specific_paths_are_forwarded(self):
+        service = self._service()
+        wanted = self.files[1].path
+        code, _text = self._run(service, paths=[wanted])
+        self.assertEqual(code, 0)
+        self.assertEqual(service.calls[0][0], [wanted])
+
+    def test_unknown_path_is_a_usage_error(self):
+        service = self._service()
+        code, text = self._run(service, paths=["不存在.docx"])
+        self.assertEqual(code, 2)
+        self.assertIn("远端没有这些文件", text)
+        self.assertEqual(service.calls, [])
+
+    def test_dest_override(self):
+        service = self._service()
+        other = self.base / "elsewhere"
+        code, _text = self._run(service, all=True, dest=str(other))
+        self.assertEqual(code, 0)
+        self.assertEqual(service.calls[0][1], other)
+
+    def test_download_error_becomes_failure_exit_code(self):
+        from archivemate.errors import DownloadError
+
+        service = self._service(error=DownloadError("网络断了"))
+        code, text = self._run(service, all=True)
+        self.assertEqual(code, 1)
+        self.assertIn("网络断了", text)
 
 
 if __name__ == "__main__":

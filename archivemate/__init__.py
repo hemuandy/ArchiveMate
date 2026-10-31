@@ -3,8 +3,9 @@
 运行时依赖：Python 3.10+ 与 PySide6（仅 GUI 需要）。核心逻辑仅用标准库。
 """
 
-__version__ = "1.3.0"
+__version__ = "2.0.0"
 APP_NAME = "ArchiveMate"
 APP_DISPLAY_NAME = "ArchiveMate 归巢"
 CREDENTIAL_TARGET = "ArchiveMate/github-token"
-CONFIG_SCHEMA_VERSION = 2
+#: 3：分类目录从「日期/类型」改成「学年/学期/类型/科目」。
+CONFIG_SCHEMA_VERSION = 3

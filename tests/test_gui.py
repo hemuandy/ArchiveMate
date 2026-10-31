@@ -183,7 +183,9 @@ class TestMainWindow(unittest.TestCase):
         self.assertEqual(row0.text(), "数学课件.pptx")
         self.assertTrue(self.window.queue_table.item(0, 1).text().endswith(
             "数学课件.pptx"))
-        self.assertIn("ppt", self.window.queue_table.item(0, 1).text())
+        dest = self.window.queue_table.item(0, 1).text()
+        self.assertIn("课件", dest)
+        self.assertIn("数学", dest)
         self.assertEqual(self.window.queue_table.item(0, 3).text(), "拖拽上传")
 
         outcome = self.service.sync_blocking()
@@ -654,6 +656,268 @@ class TestTokenHelpers(unittest.TestCase):
         self.assertEqual(
             client_cls.return_value.create_repository.call_args[0][0],
             "school-files")
+
+
+class _StubDownloader:
+    """假下载器：列目录返回给定文件，下载时按顺序回调进度。"""
+
+    def __init__(self, files, payload=b"data") -> None:
+        self.files = list(files)
+        self.payload = payload
+        self.cancelled = False
+        self.downloaded: list = []
+        self.fail: Exception | None = None
+
+    def list_files(self):
+        return list(self.files)
+
+    def download_many(self, files, dest_dir):
+        from archivemate.errors import DownloadCancelled
+
+        saved = []
+        for index, item in enumerate(files, start=1):
+            if self.cancelled:
+                raise DownloadCancelled("已取消下载。")
+            if self.fail is not None:
+                raise self.fail
+            target = Path(dest_dir) / item.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(self.payload)
+            saved.append(target)
+            self.downloaded.append(item)
+            if self.on_progress is not None:
+                total = len(self.payload)
+                self.on_progress(item.path, total, total)
+        return saved
+
+    on_progress = None
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class _StubService:
+    def __init__(self, folder: Path, downloader) -> None:
+        self.folder = folder
+        self.downloader = downloader
+
+    def download_folder(self) -> Path:
+        return self.folder
+
+    def build_downloader(self, **_kwargs):
+        return self.downloader
+
+
+@unittest.skipIf(not HAVE_QT, "需要 PySide6")
+class TestDownloadDialog(unittest.TestCase):
+    """下载对话框：列文件、勾选、进度、完成/取消文案。"""
+
+    def setUp(self):
+        from archivemate.downloader import RemoteFile
+
+        _app()
+        self.RemoteFile = RemoteFile
+        self.base = _mkdtemp()
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.target = self.base / "downloads"
+        self.target.mkdir(parents=True, exist_ok=True)
+        self.files = [
+            RemoteFile("2026-2027学年/上学期/课件/数学/数学课件.pptx", 2048),
+            RemoteFile("2026-2027学年/上学期/其他/语文/作文模板.docx", 512),
+        ]
+
+    def _dialog(self, downloader=None, folder=None):
+        from archivemate.gui.dialogs import DownloadDialog
+
+        stub = downloader or _StubDownloader(self.files)
+        service = _StubService(folder or self.target, stub)
+        dialog = DownloadDialog(service)
+        self.addCleanup(dialog.deleteLater)
+        if dialog._list_thread is not None:
+            dialog._list_thread.wait(5000)
+        _app().processEvents()
+        return dialog, stub
+
+    def test_lists_remote_files_with_sizes(self):
+        dialog, _stub = self._dialog()
+        self.assertEqual(dialog.list_widget.count(), 2)
+        text = dialog.list_widget.item(0).text()
+        self.assertIn("数学课件.pptx", text)
+        self.assertIn("2.0 KB", text)
+        self.assertIn(str(self.target), dialog.target_label.text())
+
+    def test_nothing_selected_by_default(self):
+        dialog, _stub = self._dialog()
+        self.assertFalse(dialog.download_button.isEnabled())
+        self.assertEqual(dialog._checked(), [])
+
+    def test_select_all_enables_download(self):
+        dialog, _stub = self._dialog()
+        dialog._set_all(True)
+        self.assertTrue(dialog.download_button.isEnabled())
+        self.assertEqual(len(dialog._checked()), 2)
+        dialog._set_all(False)
+        self.assertFalse(dialog.download_button.isEnabled())
+
+    def test_download_checked_writes_files_and_reports(self):
+        dialog, stub = self._dialog()
+        dialog._set_all(True)
+        dialog._download_checked()
+        if dialog._worker is not None:
+            dialog._worker.wait(5000)
+        _app().processEvents()
+
+        self.assertEqual(len(stub.downloaded), 2)
+        self.assertTrue((self.target / "数学课件.pptx").is_file())
+        self.assertIn("✓", dialog.hint.text())
+        self.assertFalse(dialog.progress.isVisible())
+
+    def test_download_all_takes_everything(self):
+        dialog, stub = self._dialog()
+        dialog._download_all()
+        if dialog._worker is not None:
+            dialog._worker.wait(5000)
+        _app().processEvents()
+        self.assertEqual(len(stub.downloaded), 2)
+
+    def test_progress_updates_hint(self):
+        dialog, _stub = self._dialog()
+        dialog._on_progress("a/b/c.pptx", 512, 2048)
+        self.assertEqual(dialog.progress.value(), 25)
+        self.assertIn("c.pptx", dialog.hint.text())
+        self.assertIn("512 B", dialog.hint.text())
+
+    def test_progress_without_total_shows_bytes(self):
+        dialog, _stub = self._dialog()
+        dialog._on_progress("a/b/c.pptx", 4096, 0)
+        self.assertIn("4.0 KB", dialog.hint.text())
+
+    def test_cancel_text_is_shown_warm(self):
+        dialog, _stub = self._dialog()
+        dialog._on_finished(False, [], "已取消下载。")
+        self.assertIn("取消", dialog.hint.text())
+        self.assertIn(COLORS["warn"], dialog.hint.styleSheet())
+
+    def test_failure_text_is_shown_red(self):
+        dialog, _stub = self._dialog()
+        dialog._on_finished(False, [], "网络断了")
+        self.assertIn("网络断了", dialog.hint.text())
+        self.assertIn(COLORS_ERROR, dialog.hint.styleSheet())
+
+    def test_list_failure_is_shown_red(self):
+        dialog, _stub = self._dialog(downloader=_StubDownloader(self.files))
+        dialog._on_listed(False, [], "Token 无效或已过期")
+        self.assertIn("Token 无效", dialog.hint.text())
+        self.assertIn(COLORS_ERROR, dialog.hint.styleSheet())
+        self.assertEqual(dialog.list_widget.count(), 0)
+
+    def test_empty_repository_message(self):
+        dialog, _stub = self._dialog(downloader=_StubDownloader([]))
+        self.assertEqual(dialog.list_widget.count(), 0)
+        self.assertIn("还没有文件", dialog.hint.text())
+
+    def test_download_failure_surfaces_message(self):
+        from archivemate.errors import DownloadError
+
+        stub = _StubDownloader(self.files)
+        stub.fail = DownloadError("下载停滞超过 120 秒，已中止。")
+        dialog, _stub = self._dialog(downloader=stub)
+        dialog._download_all()
+        if dialog._worker is not None:
+            dialog._worker.wait(5000)
+        _app().processEvents()
+        self.assertIn("停滞", dialog.hint.text())
+        self.assertIn(COLORS_ERROR, dialog.hint.styleSheet())
+
+    def test_cancel_button_clears_worker(self):
+        dialog, stub = self._dialog()
+        dialog._set_all(True)
+        dialog._download_all()
+        if dialog._worker is not None:
+            dialog._worker.wait(5000)
+        _app().processEvents()
+        self.assertIsNone(dialog._worker)
+        self.assertFalse(dialog.cancel_button.isVisible())
+
+
+@unittest.skipIf(not HAVE_QT, "需要 PySide6")
+@unittest.skipIf(not GIT, "需要安装 git")
+class TestDownloadButtonWiring(unittest.TestCase):
+    """主界面的「下载文件」按钮：配置不全时给提示，别静默失败。"""
+
+    def setUp(self):
+        from test_archivemate import LocalOnlyBackend
+        from archivemate.service import ArchiveMateService
+        from archivemate.gui import main_window as mw
+
+        self.LocalOnlyBackend = LocalOnlyBackend
+        self.base = _mkdtemp()
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.home = self.base / "home"
+        self.watch = self.base / "watch"
+        for directory in (self.home, self.watch):
+            directory.mkdir(parents=True, exist_ok=True)
+        self._old_home = os.environ.get("ARCHIVEMATE_HOME")
+        os.environ["ARCHIVEMATE_HOME"] = str(self.home)
+        app_paths.reset_cache()
+
+        cfg = Config.default()
+        cfg.watch_folders = [str(self.watch)]
+        cfg.archive_folder = str(self.base / "archive")
+        cfg.onboarding_completed = True
+        cfg.normalize()
+
+        self.service = ArchiveMateService(
+            cfg, auto_start_watcher=False,
+            backend_factory=lambda: LocalOnlyBackend(
+                self.base / "remote.git", "", "main", git_exe=GIT))
+        self.service.apply_config(cfg)
+
+        _app()
+        self.dialogs: list[tuple[str, str]] = []
+
+        def handler(parent, title, text, **kwargs):
+            self.dialogs.append((str(title), str(text)))
+            return None
+
+        self._real = (mw.warn, mw.info, mw.confirm, mw.ask)
+        mw.warn = mw.info = mw.confirm = mw.ask = handler
+        self.addCleanup(self._restore)
+        self.window = mw.MainWindow(service=self.service)
+        self.addCleanup(self._destroy)
+
+    def _restore(self):
+        from archivemate.gui import main_window as mw
+
+        mw.warn, mw.info, mw.confirm, mw.ask = self._real
+
+    def _destroy(self):
+        try:
+            self.window._pump.stop()
+            self.window._auto_timer.stop()
+            self.window.service.stop()
+            self.window.deleteLater()
+        finally:
+            if self._old_home is None:
+                os.environ.pop("ARCHIVEMATE_HOME", None)
+            else:
+                os.environ["ARCHIVEMATE_HOME"] = self._old_home
+            app_paths.reset_cache()
+
+    def test_button_exists(self):
+        self.assertEqual(self.window.download_button.text(), "下载文件")
+
+    def test_warns_when_repository_missing(self):
+        self.window.service.config.repository.owner = ""
+        self.window.service.config.repository.name = ""
+        self.window._open_download()
+        self.assertTrue(any("仓库" in title for title, _text in self.dialogs))
+
+    def test_disabled_while_syncing(self):
+        self.window._set_syncing(True)
+        self.assertFalse(self.window.download_button.isEnabled())
+        self.window._set_syncing(False)
+        self.assertTrue(self.window.download_button.isEnabled())
 
 
 class TestGitHubApiCallSites(unittest.TestCase):

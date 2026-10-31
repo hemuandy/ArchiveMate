@@ -40,3 +40,11 @@ class PushRejected(ArchiveMateError):
 
 class FileTooLarge(ArchiveMateError):
     """文件体积超过阻塞阈值。"""
+
+
+class DownloadError(ArchiveMateError):
+    """从 GitHub 下载失败（网络、权限或磁盘问题）。"""
+
+
+class DownloadCancelled(DownloadError):
+    """用户主动取消了下载。"""

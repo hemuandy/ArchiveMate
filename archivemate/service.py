@@ -14,6 +14,8 @@ from typing import Any, Callable, Iterable, Sequence
 
 from . import app_paths, classify, config as config_module, credentials, logging_setup
 from .config import Config
+from .downloader import GitHubDownloader, RemoteFile
+from .errors import DownloadError
 from .fsutil import clear_directory, describe_size_limit, directory_size, human_size
 from .git_backend import GitBackend, find_git
 from .sync import SyncEngine, SyncOutcome, unique_dest_rel
@@ -316,6 +318,55 @@ class ArchiveMateService:
             self._log(f"同步时发生未预期的错误：{exc}")
             self._emit(EVENT_STATUS, f"同步失败：{exc}")
             self._emit(EVENT_SYNC_DONE, SyncOutcome(ok=False, message=str(exc)))
+
+    # ------------------------------------------------------------------
+    # 从 GitHub 下载
+    # ------------------------------------------------------------------
+
+    def download_folder(self) -> Path:
+        """下载落点（设置里可改，默认系统 Downloads）。"""
+        return self.config.resolved_download_folder()
+
+    def build_downloader(self, *, on_progress=None,
+                         logger: Callable[[str], None] | None = None) -> GitHubDownloader:
+        repo = self.config.repository
+        return GitHubDownloader(
+            credentials.get_token() or "",
+            repo.owner.strip(),
+            repo.resolved_name(),
+            repo.branch.strip() or "main",
+            proxy=self.config.git.proxy,
+            logger=logger or self._log,
+            on_progress=on_progress,
+        )
+
+    def list_remote_files(self,
+                          downloader: GitHubDownloader | None = None) -> list[RemoteFile]:
+        """列出仓库里的全部文件（只花两三个小请求）。"""
+        active = downloader or self.build_downloader()
+        files = active.list_files()
+        self._log(f"远端共有 {len(files)} 个文件。")
+        return files
+
+    def download_files(self, paths: Sequence[str] | None = None, *,
+                       downloader: GitHubDownloader | None = None,
+                       dest_dir: Path | None = None,
+                       on_progress=None) -> list[Path]:
+        """下载指定路径（None = 全部）到下载目录，返回写入的文件路径。"""
+        active = downloader or self.build_downloader(on_progress=on_progress)
+        target_dir = Path(dest_dir) if dest_dir else self.download_folder()
+        files = active.list_files()
+        if not files:
+            self._log("远端没有可下载的文件。")
+            return []
+        if paths is not None:
+            wanted = set(paths)
+            files = [item for item in files if item.path in wanted]
+            if not files:
+                raise DownloadError("选中的文件在远端已经不存在了，请刷新列表。")
+        saved = active.download_many(files, target_dir)
+        self._log(f"已下载 {len(saved)} 个文件到 {target_dir}")
+        return saved
 
     # ------------------------------------------------------------------
     # 归档文件夹管理

@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .. import APP_DISPLAY_NAME, __version__, app_paths, classify
+from .. import APP_DISPLAY_NAME, __version__, app_paths, classify, credentials
 from ..config import SYNC_SCHEDULE_CHOICES
 from ..fsutil import human_size
 from ..schedule import next_run, schedule_label
@@ -27,7 +27,9 @@ from ..service import (
     ArchiveMateService,
 )
 from ..tracker import ORIGIN_LABELS, STATUS_LABELS, STATUS_PENDING
-from .dialogs import OnboardingDialog, SettingsDialog, ask, confirm, info, warn
+from .dialogs import (
+    DownloadDialog, OnboardingDialog, SettingsDialog, ask, confirm, info, warn,
+)
 from .theme import COLORS
 from .widgets import DropArea, ListEditor, StatusPill, shorten_path
 
@@ -100,9 +102,11 @@ class MainWindow(QMainWindow):
         self.cancel_button.setObjectName("danger")
         self.cancel_button.setVisible(False)
         self.scan_button = QPushButton("扫描现有文件", central)
+        self.download_button = QPushButton("下载文件", central)
         self.settings_button = QPushButton("设置", central)
         for button in (self.sync_button, self.cancel_button,
-                       self.scan_button, self.settings_button):
+                       self.scan_button, self.download_button,
+                       self.settings_button):
             header.addWidget(button)
 
         left = QWidget(central)
@@ -172,9 +176,9 @@ class MainWindow(QMainWindow):
         left.setMaximumWidth(330)
         # 两个列表别把左栏撑满，留出空间给下面的同步与归档
         self.watch_editor.list.setMinimumHeight(84)
-        self.watch_editor.list.setMaximumHeight(100)
+        self.watch_editor.list.setMaximumHeight(84)
         self.types_editor.list.setMinimumHeight(84)
-        self.types_editor.list.setMaximumHeight(100)
+        self.types_editor.list.setMaximumHeight(84)
 
         right = QWidget(central)
         right_layout = QVBoxLayout(right)
@@ -263,6 +267,7 @@ class MainWindow(QMainWindow):
         self.sync_button.clicked.connect(self._sync_now)
         self.cancel_button.clicked.connect(self._cancel_sync)
         self.scan_button.clicked.connect(self._scan_existing)
+        self.download_button.clicked.connect(self._open_download)
         self.settings_button.clicked.connect(self._open_settings)
         self.interval_combo.currentIndexChanged.connect(self._on_interval_changed)
         self.watch_editor.changed.connect(self._on_watch_changed)
@@ -339,6 +344,7 @@ class MainWindow(QMainWindow):
         self.sync_button.setEnabled(not syncing)
         self.sync_button.setText("正在同步…" if syncing else "立即同步")
         self.scan_button.setEnabled(not syncing)
+        self.download_button.setEnabled(not syncing)
         # 同步卡住时，用户必须有一个能按的按钮
         self.cancel_button.setVisible(syncing)
         self.cancel_button.setEnabled(syncing)
@@ -620,6 +626,18 @@ class MainWindow(QMainWindow):
         self._refresh_archive_label()
         self._apply_interval()
         self._log("设置已保存。")
+
+    def _open_download(self) -> None:
+        if not self.service.config.repository.owner.strip():
+            warn(self, "还没有配置仓库",
+                 "先在「设置」里填好 GitHub 用户名和仓库名，再回来下载。")
+            return
+        if not credentials.has_token():
+            warn(self, "还没有配置 Token",
+                 "下载需要访问私有仓库，先在「设置」里保存一个 GitHub Token。")
+            return
+        dialog = DownloadDialog(self.service, self)
+        dialog.exec()
 
     def _maybe_onboard(self) -> None:
         dialog = OnboardingDialog(self.service.config, self)
