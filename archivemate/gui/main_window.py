@@ -709,14 +709,37 @@ def run(argv: list[str] | None = None) -> int:
               f"屏幕 {screen.geometry().width() if screen else '?'}x"
               f"{screen.geometry().height() if screen else '?'}")
         # 两个对话框是延迟导入的，PyInstaller 容易漏收，顺手确认它们也能建起来
-        from .dialogs import OnboardingDialog, SettingsDialog
+        from .dialogs import DownloadDialog, OnboardingDialog, SettingsDialog
 
         config = window.service.config
         settings = SettingsDialog(config, window)
         onboarding = OnboardingDialog(config, window)
         print(f"对话框已构建：设置「{settings.get_token_button.text()}」"
               f" / 引导「{onboarding.get_token_button.text()}」")
-        for dialog in (settings, onboarding):
+
+        class _StubDownloads:
+            """只够把下载对话框搭起来，不发任何请求。"""
+
+            def build_downloader(self, **kwargs):
+                return None
+
+            def list_remote_files(self, downloader=None):
+                return []
+
+            def download_folder(self):
+                return config.resolved_download_folder()
+
+            def download_files(self, paths=None, *, downloader=None,
+                               dest_dir=None, on_progress=None):
+                return []
+
+        downloads = DownloadDialog(_StubDownloads(), window)
+        if downloads._list_thread is not None:
+            downloads._list_thread.wait(5000)
+        print(f"下载对话框已构建：远端 {downloads.list_widget.count()} 项，"
+              f"目标目录 {downloads.target_label.text()}")
+
+        for dialog in (settings, onboarding, downloads):
             dialog.close()
             dialog.deleteLater()
         window.close()
